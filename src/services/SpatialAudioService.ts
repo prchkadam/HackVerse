@@ -8,8 +8,7 @@
  * (usually 44100 or 48000 Hz) to ensure correct speed and pitch.
  * Chunks are scheduled sequentially for smooth continuous speech.
  */
-
-import { AudioContext, AudioBuffer } from 'react-native-audio-api';
+import { AudioContext } from 'react-native-audio-api';
 
 const GEMINI_RATE = 24_000; // Gemini native-audio output rate
 
@@ -146,7 +145,7 @@ export class SpatialAudioService {
         );
       }
     } catch (err) {
-      console.error('[SpatialAudio] Error playing chunk:', err);
+      console.warn('[SpatialAudio] Error playing chunk:', err);
     }
   }
 

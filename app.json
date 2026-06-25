@@ -9,7 +9,7 @@
     "userInterfaceStyle": "dark",
     "ios": {
       "bundleIdentifier": "com.echosight.app",
-      "icon": "./assets/expo.icon",
+      "icon": "./assets/images/icon.png",
       "infoPlist": {
         "NSCameraUsageDescription": "EchoSight uses your camera to detect obstacles and help you navigate safely.",
         "NSMicrophoneUsageDescription": "EchoSight may use the microphone for future voice command support."
@@ -24,7 +24,9 @@
       },
       "permissions": [
         "android.permission.CAMERA",
-        "android.permission.RECORD_AUDIO"
+        "android.permission.RECORD_AUDIO",
+        "android.permission.SEND_SMS",
+        "android.permission.CALL_PHONE"
       ],
       "predictiveBackGestureEnabled": false
     },
@@ -63,7 +65,9 @@
             "buildToolsVersion": "36.0.0"
           }
         }
-      ]
+      ],
+      "expo-image",
+      "expo-audio"
     ],
     "experiments": {
       "typedRoutes": true

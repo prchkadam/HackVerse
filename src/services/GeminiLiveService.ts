@@ -1,10 +1,11 @@
 /**
  * GeminiLiveService
  *
- * Manages a stateful WebSocket connection to the Gemini Multimodal Live API.
- * Protocol: BidiGenerateContent (bidirectional streaming)
- * Input:  Base64 JPEG video frames  (realtime_input → media_chunks)
- * Output: Native PCM audio at 24kHz (server_content → inline_data)
+ * Uses the Gemini REST API (generateContent) to analyze camera frames.
+ * Works with the FREE Gemini API tier — no WebSocket/BidiGenerateContent needed.
+ *
+ * Input:  Base64 JPEG video frames
+ * Output: Text descriptions spoken via device TTS
  */
 
 export type ConnectionStatus =
@@ -27,11 +28,9 @@ export type AudioChunkCallback = (chunk: AudioChunk) => void;
 export type StatusChangeCallback = (status: ConnectionStatus) => void;
 export type TranscriptCallback = (text: string) => void;
 
-// ─── Gemini Live API endpoint ──────────────────────────────────────────────────
-const WS_BASE =
-  'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
-
-const MODEL = 'models/gemini-2.5-flash-native-audio-latest';
+// ─── Gemini REST API endpoint ──────────────────────────────────────────────────
+const REST_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+const MODEL = 'gemini-2.0-flash';
 
 const SYSTEM_PROMPT =
   'You are a friendly navigation assistant helping a blind person walk safely. ' +
@@ -42,13 +41,6 @@ const SYSTEM_PROMPT =
   'Keep every response to one or two short sentences. ' +
   'Immediately warn about hazards like stairs, cars, or obstacles in the path.';
 
-// Temporary hardcode for demo — remove before sharing code!
-const API_KEY = '';
-
-// ─── Connection retry config ──────────────────────────────────────────────────
-const MAX_RETRIES = 3;
-const RETRY_DELAYS = [1000, 2000, 4000]; // ms between retries (exponential backoff)
-
 // ─── Pan inference from transcript text ───────────────────────────────────────
 function inferPanFromText(text: string): number {
   const lower = text.toLowerCase();
@@ -58,333 +50,344 @@ function inferPanFromText(text: string): number {
   return 0.0; // default: centre
 }
 
-// ─── Decode WebSocket message data (React Native / Hermes compatible) ─────────
-//
-// React Native's Hermes engine may deliver WebSocket messages as Blob-like
-// objects where `data instanceof Blob` returns FALSE because the constructor
-// differs from the global Blob. We use duck-typing instead.
-//
-async function getEventDataText(data: any): Promise<string> {
-  // 1. Already a string — most common case
-  if (typeof data === 'string') {
-    return data;
-  }
-
-  // 2. Blob-like object with .text() method (modern Blob API)
-  if (data && typeof data.text === 'function') {
-    try {
-      return await data.text();
-    } catch {
-      // Fall through to other strategies
-    }
-  }
-
-  // 3. ArrayBuffer
-  if (data instanceof ArrayBuffer) {
-    return arrayBufferToString(new Uint8Array(data));
-  }
-
-  // 4. TypedArray / DataView
-  if (ArrayBuffer.isView(data)) {
-    return arrayBufferToString(new Uint8Array((data as any).buffer, (data as any).byteOffset, (data as any).byteLength));
-  }
-
-  // 5. Blob-like object with .arrayBuffer() method
-  if (data && typeof data.arrayBuffer === 'function') {
-    try {
-      const ab = await data.arrayBuffer();
-      return arrayBufferToString(new Uint8Array(ab));
-    } catch {
-      // Fall through
-    }
-  }
-
-  // 6. Blob-like object — use FileReader as last resort
-  if (data && typeof data.size === 'number' && typeof FileReader !== 'undefined') {
-    try {
-      return await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = () => reject(reader.error);
-        reader.readAsText(data);
-      });
-    } catch {
-      // Fall through
-    }
-  }
-
-  // 7. Absolute fallback — convert to string
-  console.warn('[Gemini] Unknown message data type:', typeof data, Object.prototype.toString.call(data));
-  return String(data);
-}
-
-/** Convert Uint8Array to string (UTF-8 safe for ASCII JSON) */
-function arrayBufferToString(bytes: Uint8Array): string {
-  // For small payloads, String.fromCharCode is fine.
-  // For large payloads, process in chunks to avoid stack overflow.
-  const CHUNK = 8192;
-  let result = '';
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    const slice = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
-    result += String.fromCharCode.apply(null, slice as any);
-  }
-  return result;
-}
-
 // ─── Service ──────────────────────────────────────────────────────────────────
 export class GeminiLiveService {
-  private ws: WebSocket | null = null;
   private apiKey: string = '';
   private lastPan: number = 0;
-  private setupSent: boolean = false;
-  private connectAborted: boolean = false;
-  private framesSent: number = 0;
-  private audioChunksReceived: number = 0;
-  private waitingForResponse: boolean = false;
+  private _connected: boolean = false;
+  private _textOnlyMode: boolean = false;
+  private _aborted: boolean = false;
+  private _processing: boolean = false;
+  private _rateLimitedUntil: number = 0;
+  private _consecutiveErrors: number = 0;
+  private _priorityProcessing: boolean = false; // User-initiated requests take priority
 
-  // Callbacks
-  onAudioChunk: AudioChunkCallback = () => { };
-  onStatusChange: StatusChangeCallback = () => { };
-  onTranscript: TranscriptCallback = () => { };
+  // Callbacks (same interface as before)
+  onAudioChunk: AudioChunkCallback = () => {};
+  onStatusChange: StatusChangeCallback = () => {};
+  onTranscript: TranscriptCallback = () => {};
+  onTextResponse: TranscriptCallback = () => {};
 
-  // ── Connect (with automatic retry) ──────────────────────────────────────────
+  // ── Connect (validate API key with a lightweight request) ──────────────────
   async connect(apiKey: string): Promise<void> {
-    this.apiKey = apiKey || API_KEY;
-    this.connectAborted = false;
-    this.framesSent = 0;
-    this.audioChunksReceived = 0;
-    this.waitingForResponse = false;
+    this.apiKey = apiKey ? apiKey.trim() : '';
+    this._aborted = false;
+    this._processing = false;
+    this._rateLimitedUntil = 0;
+    this._consecutiveErrors = 0;
 
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      if (this.connectAborted) {
-        throw new Error('Connection aborted by user');
-      }
-
-      try {
-        console.log(`[Gemini] Connection attempt ${attempt + 1}/${MAX_RETRIES}...`);
-        await this._connectOnce();
-        console.log('[Gemini] Connected successfully!');
-        return; // success!
-      } catch (err: any) {
-        console.warn(`[Gemini] Attempt ${attempt + 1} failed:`, err?.message || err);
-
-        if (this.connectAborted) {
-          throw new Error('Connection aborted by user');
-        }
-
-        if (attempt < MAX_RETRIES - 1) {
-          const delay = RETRY_DELAYS[attempt] || 4000;
-          console.log(`[Gemini] Retrying in ${delay}ms...`);
-          await new Promise(r => setTimeout(r, delay));
-        }
-      }
+    if (!this.apiKey) {
+      console.warn('[Gemini] No API key provided');
+      this.onStatusChange('error');
+      throw new Error('No API key provided');
     }
 
-    throw new Error(`Failed to connect after ${MAX_RETRIES} attempts`);
+    this.onStatusChange('connecting');
+    console.log('[Gemini] REST mode — validating API key with model:', MODEL);
+
+    // Actually validate the API key with a lightweight request
+    try {
+      const url = `${REST_BASE}/models/${MODEL}?key=${encodeURIComponent(this.apiKey)}`;
+      const response = await fetch(url, { method: 'GET' });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.warn('[Gemini] API key validation failed:', response.status, errText.substring(0, 200));
+
+        if (response.status === 400 || response.status === 403) {
+          this.onStatusChange('error');
+          throw new Error(`Invalid API key (HTTP ${response.status}). Please check your Gemini API key in settings.`);
+        }
+        if (response.status === 404) {
+          // Model not found — might still work, proceed cautiously
+          console.warn('[Gemini] Model not found, but proceeding...');
+        } else {
+          this.onStatusChange('error');
+          throw new Error(`API validation failed (HTTP ${response.status})`);
+        }
+      } else {
+        console.log('[Gemini] ✅ API key validated successfully');
+      }
+    } catch (err: any) {
+      if (err?.message?.includes('Invalid API key') || err?.message?.includes('API validation failed')) {
+        throw err;
+      }
+      // Network error — could be offline, proceed anyway since REST is stateless
+      console.warn('[Gemini] Could not validate API key (network issue?):', err?.message);
+    }
+
+    this._connected = true;
+    this.onStatusChange('connected');
+    console.log('[Gemini] ✅ Ready! Will send frames via REST generateContent.');
   }
 
-  private _connectOnce(): Promise<void> {
-    this.setupSent = false;
+  // ── Core REST request helper ───────────────────────────────────────────────
+  private async _request(parts: any[], systemText?: string): Promise<string | null> {
+    if (!this._connected || this._aborted) return null;
 
-    return new Promise((resolve, reject) => {
-      this.onStatusChange('connecting');
-
-      const url = `${WS_BASE}?key=${encodeURIComponent(this.apiKey)}`;
-      console.log('[Gemini] Opening WebSocket to:', url.substring(0, 80) + '...');
-
-      const ws = new WebSocket(url);
-      this.ws = ws;
-
-      // Track whether this promise has been settled
-      let settled = false;
-      const settle = (fn: () => void) => {
-        if (!settled) {
-          settled = true;
-          fn();
-        }
-      };
-
-      // Connection timeout — if setup isn't complete within 15 seconds, fail
-      const timeout = setTimeout(() => {
-        settle(() => {
-          console.warn('[Gemini] Connection timed out (15s)');
-          try { ws.close(); } catch { }
-          reject(new Error('Connection timed out'));
-        });
-      }, 15_000);
-
-      ws.onopen = () => {
-        console.log('[Gemini] WebSocket opened, sending setup...');
-        // Send setup message immediately on open
-        const setupMsg = {
-          setup: {
-            model: MODEL,
-            generation_config: {
-              response_modalities: ['AUDIO'],
-              speech_config: {
-                voice_config: {
-                  prebuilt_voice_config: {
-                    voice_name: 'Kore',
-                  },
-                },
-              },
-            },
-            system_instruction: {
-              parts: [{ text: SYSTEM_PROMPT }],
-            },
-          },
-        };
-        ws.send(JSON.stringify(setupMsg));
-        this.setupSent = true;
-        console.log('[Gemini] Setup message sent');
-      };
-
-      ws.onmessage = async (event: WebSocketMessageEvent) => {
-        try {
-          const text = await getEventDataText(event.data);
-          console.log('[Gemini] Message received, length:', text.length, 'preview:', text.substring(0, 100));
-          const data = JSON.parse(text);
-          this._handleMessage(data, () => {
-            clearTimeout(timeout);
-            settle(() => resolve());
-          });
-        } catch (err) {
-          console.warn('[Gemini] Failed to parse message:', err);
-          console.warn('[Gemini] Data type:', typeof event.data, Object.prototype.toString.call(event.data));
-          // Don't reject on parse errors — the WS is still open
-        }
-      };
-
-      ws.onerror = (err) => {
-        console.error('[Gemini] WebSocket error event fired');
-        // Don't reject immediately — onclose will follow with more info
-        // Only reject if we haven't connected yet
-      };
-
-      ws.onclose = (event) => {
-        clearTimeout(timeout);
-        console.log('[Gemini] WS closed:', event.code, event.reason);
-        this.onStatusChange('disconnected');
-        settle(() => {
-          reject(new Error(`WebSocket closed: ${event.code} ${event.reason || 'no reason'}`));
-        });
-      };
-    });
-  }
-
-  // ── Message handler ────────────────────────────────────────────────────────
-  private _handleMessage(data: Record<string, unknown>, resolveConnect?: () => void) {
-    // Setup acknowledged → we are connected
-    if (data.setupComplete !== undefined) {
-      console.log('[Gemini] Setup complete — fully connected!');
-      this.onStatusChange('connected');
-      resolveConnect?.();
-      return;
+    // Rate-limit cooldown: skip if we're still backing off
+    if (Date.now() < this._rateLimitedUntil) {
+      const secsLeft = Math.ceil((this._rateLimitedUntil - Date.now()) / 1000);
+      console.log(`[Gemini] Rate-limited, skipping request (${secsLeft}s cooldown remaining)`);
+      return null;
     }
 
-    // Server content with audio / transcript
-    const serverContent = data.serverContent as Record<string, unknown> | undefined;
-    if (!serverContent) {
-      // Log any unknown message types for debugging
-      console.log('[Gemini] Unknown message type, keys:', Object.keys(data).join(', '));
-      return;
-    }
+    const url = `${REST_BASE}/models/${MODEL}:generateContent?key=${encodeURIComponent(this.apiKey)}`;
 
-    // Check if the model's turn is complete (we can send the next frame)
-    if (serverContent.turnComplete) {
-      console.log('[Gemini] ✅ Model turn complete — ready for next frame');
-      this.waitingForResponse = false;
-    }
-
-    const modelTurn = serverContent.modelTurn as Record<string, unknown> | undefined;
-    if (!modelTurn) return;
-
-    const parts = modelTurn.parts as Array<Record<string, unknown>> | undefined;
-    if (!Array.isArray(parts)) return;
-
-    for (const part of parts) {
-      // ── Text transcript (for pan inference) ──
-      if (typeof part.text === 'string') {
-        const text = part.text;
-        console.log('[Gemini] 📝 Transcript received:', text.substring(0, 100));
-        this.lastPan = inferPanFromText(text);
-        this.onTranscript(text);
-      }
-
-      // ── Inline audio data (PCM) ──
-      const inlineData = part.inlineData as Record<string, unknown> | undefined;
-      if (inlineData) {
-        const mimeType = inlineData.mimeType as string | undefined;
-        const pcmBase64 = inlineData.data as string | undefined;
-        if (pcmBase64 && mimeType?.startsWith('audio/')) {
-          this.audioChunksReceived++;
-          console.log(`[Gemini] 🔊 Audio chunk #${this.audioChunksReceived}, mime: ${mimeType}, size: ${(pcmBase64.length / 1024).toFixed(1)}KB`);
-          this.onAudioChunk({
-            pcmBase64,
-            pan: this.lastPan,
-          });
-        }
-      }
-    }
-  }
-
-  // ── Send a JPEG frame as a conversational turn ───────────────────────────
-  sendFrame(base64Jpeg: string): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.setupSent) {
-      return;
-    }
-
-    // Don't send a new frame while the model is still responding to the previous one
-    if (this.waitingForResponse) {
-      console.log('[Gemini] Skipping frame — waiting for model response...');
-      return;
-    }
-
-    this.framesSent++;
-    this.waitingForResponse = true;
-    console.log(`[Gemini] Sending frame #${this.framesSent} as clientContent, size: ${(base64Jpeg.length / 1024).toFixed(1)}KB`);
-
-    // Send as a conversational turn with image + text prompt
-    // This tells the model: "Here's what the camera sees, please respond"
-    const msg = {
-      clientContent: {
-        turns: [
-          {
-            role: 'user',
-            parts: [
-              {
-                inlineData: {
-                  mimeType: 'image/jpeg',
-                  data: base64Jpeg,
-                },
-              },
-              {
-                text: 'What is in front of me right now? Tell me naturally in one short sentence.',
-              },
-            ],
-          },
-        ],
-        turnComplete: true,
+    const body: any = {
+      contents: [{ parts }],
+      generationConfig: {
+        maxOutputTokens: 4096,
+        temperature: 0.7,
       },
     };
 
-    this.ws.send(JSON.stringify(msg));
+    // Add system instruction
+    if (systemText) {
+      body.systemInstruction = { parts: [{ text: systemText }] };
+    }
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.warn('[Gemini] REST error:', response.status, errText.substring(0, 200));
+
+        this._consecutiveErrors++;
+
+        // Rate-limited: back off for 30 seconds
+        if (response.status === 429) {
+          this._rateLimitedUntil = Date.now() + 30_000;
+          console.warn('[Gemini] ⏳ Rate limited! Cooling down for 30 seconds...');
+        }
+
+        // Invalid API key
+        if (response.status === 400 || response.status === 403) {
+          console.error('[Gemini] ❌ API key appears invalid. Check your settings.');
+          // After 3 consecutive auth errors, mark as error state
+          if (this._consecutiveErrors >= 3) {
+            this.onStatusChange('error');
+          }
+        }
+
+        return null;
+      }
+
+      // Reset consecutive error counter on success
+      this._consecutiveErrors = 0;
+
+      const data = await response.json();
+      const candidate = data?.candidates?.[0];
+      const text = candidate?.content?.parts?.[0]?.text;
+
+      if (text) {
+        console.log('[Gemini] 📝 Response:', text.substring(0, 100));
+        return text;
+      }
+
+      console.warn('[Gemini] No text in response:', JSON.stringify(data).substring(0, 200));
+      return null;
+    } catch (err: any) {
+      console.warn('[Gemini] REST request failed:', err?.message || err);
+      this._consecutiveErrors++;
+      if (this._consecutiveErrors >= 5) {
+        this.onStatusChange('error');
+      }
+      return null;
+    }
+  }
+
+  // ── Send a JPEG frame for navigation description ───────────────────────────
+  sendFrame(base64Jpeg: string): void {
+    if (this._processing || this._priorityProcessing) {
+      console.log('[Gemini] Skipping frame — still processing previous...');
+      return;
+    }
+
+    this._processing = true;
+    this._sendFrameAsync(base64Jpeg).finally(() => {
+      this._processing = false;
+    });
+  }
+
+  private async _sendFrameAsync(base64Jpeg: string): Promise<void> {
+    console.log(`[Gemini] Sending frame via REST, size: ${(base64Jpeg.length / 1024).toFixed(1)}KB`);
+
+    const parts = [
+      {
+        inlineData: {
+          mimeType: 'image/jpeg',
+          data: base64Jpeg,
+        },
+      },
+      {
+        text: 'What is in front of me right now? Tell me naturally in one short sentence.',
+      },
+    ];
+
+    const text = await this._request(parts, SYSTEM_PROMPT);
+    if (text) {
+      this.lastPan = inferPanFromText(text);
+      this.onTranscript(text);
+      this.onTextResponse(text);
+    }
+  }
+
+  // ── Send a JPEG frame with a custom user question ──────────────────────────
+  sendFrameWithQuestion(base64Jpeg: string, question: string): void {
+    if (this._processing) return;
+    this._processing = true;
+
+    (async () => {
+      console.log(`[Gemini] Sending frame with question: "${question.substring(0, 60)}"`);
+      const parts = [
+        { inlineData: { mimeType: 'image/jpeg', data: base64Jpeg } },
+        { text: question },
+      ];
+      const text = await this._request(parts, SYSTEM_PROMPT);
+      if (text) {
+        this.lastPan = inferPanFromText(text);
+        this.onTranscript(text);
+        this.onTextResponse(text);
+      }
+    })().finally(() => { this._processing = false; });
+  }
+
+  // ── Send audio question with a JPEG frame ──────────────────────────────────
+  /**
+   * For REST mode, audio questions are not directly supported.
+   * We fall back to sending the frame with a generic question prompt.
+   */
+  sendAudioQuestion(base64Jpeg: string, _base64Audio: string): void {
+    // User-initiated — proceed even if regular frame is processing
+    this._processing = true;
+    this._priorityProcessing = true;
+
+    (async () => {
+      console.log('[Gemini] Audio question received — analyzing frame with REST...');
+      const parts = [
+        { inlineData: { mimeType: 'image/jpeg', data: base64Jpeg } },
+        {
+          text: 'The user is asking a question about what they see. Describe the scene in detail and answer any obvious questions about it. Be concise and natural.',
+        },
+      ];
+      const text = await this._request(parts, SYSTEM_PROMPT);
+      if (text) {
+        this.lastPan = inferPanFromText(text);
+        this.onTranscript(text);
+        this.onTextResponse(text);
+      }
+    })().finally(() => { this._processing = false; this._priorityProcessing = false; });
+  }
+
+  // ── Send a JPEG frame for detailed scene description ───────────────────────
+  async sendDetailedFrame(base64Jpeg: string): Promise<boolean> {
+    // User-initiated — proceed even if regular frame is processing
+    this._processing = true;
+    this._priorityProcessing = true;
+
+    try {
+      console.log('[Gemini] Sending detailed scene description request');
+      const parts = [
+        { inlineData: { mimeType: 'image/jpeg', data: base64Jpeg } },
+        {
+          text: 'Describe everything you can see in this image in rich detail. ' +
+            'Include the overall environment, all visible objects, people, colors, distances, ' +
+            'the layout of the space, any text or signs, lighting conditions, and potential paths. ' +
+            'Speak naturally as if painting a picture for a blind person. ' +
+            'Be thorough but still use simple, clear language. No formatting.',
+        },
+      ];
+      const text = await this._request(parts);
+      if (text) {
+        this.lastPan = inferPanFromText(text);
+        this.onTranscript(text);
+        this.onTextResponse(`Scene analysis: ${text}`);
+        return true;
+      }
+      return false;
+    } finally {
+      this._processing = false;
+      this._priorityProcessing = false;
+    }
+  }
+
+  // ── Send a JPEG frame for OCR / text recognition ──────────────────────────
+  async sendOcrFrame(base64Jpeg: string): Promise<boolean> {
+    // User-initiated — proceed even if regular frame is processing
+    this._processing = true;
+    this._priorityProcessing = true;
+
+    try {
+      console.log('[Gemini] Sending OCR text recognition request');
+      const parts = [
+        { inlineData: { mimeType: 'image/jpeg', data: base64Jpeg } },
+        {
+          text: 'You are identifying currency banknotes for a blind user.\n\n' +
+            'CRITICAL RULES FOR COUNTING:\n' +
+            '1. A single physical banknote has its denomination printed MULTIPLE TIMES (e.g. US Dollars have values in all 4 corners and on both left and right sides). Do NOT count these as multiple bills. It is just ONE bill.\n' +
+            '2. THE BEST WAY TO COUNT: Count the central PORTRAITS (the historical figures/faces). Every banknote has exactly ONE portrait. If you see 7 faces, there are exactly 7 notes. Count the faces!\n' +
+            '3. Alternatively, count the distinct rectangular paper boundaries.\n' +
+            '4. Do NOT count denomination text occurrences. You must count physical pieces of paper/faces.\n\n' +
+            'STEP 1: Look at the image and count how many separate PORTRAITS / distinct paper rectangles you see.\n' +
+            'STEP 2: For each distinct bill you found, identify its denomination and currency.\n' +
+            'STEP 3: Output a single line in this exact format at the very beginning of your response:\n' +
+            'NOTES: {"total_bills": <number>, "bills": [{"denomination": <value>, "currency": "<name>", "count": <how_many_of_this_type>}]}\n\n' +
+            'Example — if you see exactly one 100 US Dollar bill and exactly one 50 US Dollar bill (total 2 faces/notes):\n' +
+            'NOTES: {"total_bills": 2, "bills": [{"denomination": 100, "currency": "US Dollar", "count": 1}, {"denomination": 50, "currency": "US Dollar", "count": 1}]}\n\n' +
+            'After the NOTES line, transcribe any other visible non-currency text verbatim.\n' +
+            'If no banknotes are visible, do not output a NOTES line. Just transcribe any visible text, or output "No text detected".',
+        },
+      ];
+      const text = await this._request(parts);
+      if (text) {
+        this.lastPan = inferPanFromText(text);
+        this.onTranscript(text);
+        const finalText = text.toLowerCase().includes('no text detected') || text.toLowerCase().includes('notes:')
+          ? text
+          : `Text found: ${text}`;
+        this.onTextResponse(finalText);
+        return true;
+      }
+      return false;
+    } finally {
+      this._processing = false;
+      this._priorityProcessing = false;
+    }
   }
 
   // ── Disconnect ─────────────────────────────────────────────────────────────
   disconnect(): void {
-    this.connectAborted = true; // Stop any in-progress retry loop
-    if (this.ws) {
-      this.ws.close(1000, 'User stopped session');
-      this.ws = null;
-    }
-    this.setupSent = false;
+    this._aborted = true;
+    this._connected = false;
+    this._processing = false;
+    this._priorityProcessing = false;
     this.lastPan = 0;
+    this._consecutiveErrors = 0;
     this.onStatusChange('disconnected');
   }
 
+  /** Enable text-only mode (kept for API compatibility — REST is always text) */
+  set textOnlyMode(value: boolean) {
+    this._textOnlyMode = value;
+  }
+
+  get textOnlyMode(): boolean {
+    return this._textOnlyMode;
+  }
+
   get isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN && this.setupSent;
+    return this._connected;
+  }
+
+  /** Alias kept for backward-compatibility with setup property */
+  get setupSent(): boolean {
+    return this._connected;
   }
 }
 

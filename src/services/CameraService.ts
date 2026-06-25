@@ -10,6 +10,7 @@
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
+import * as ImageManipulator from 'expo-image-manipulator';
 import type { Camera } from 'react-native-vision-camera';
 
 export type FrameCallback = (base64Jpeg: string) => void;
@@ -49,9 +50,19 @@ export class CameraService {
           localPath = `file://${localPath}`;
         }
 
-        const base64 = await FileSystem.readAsStringAsync(localPath, {
-          encoding: FileSystem.EncodingType.Base64,
-        });
+        // Compress background frames heavily for speed: 600px width, 50% quality
+        const manipResult = await ImageManipulator.manipulateAsync(
+          localPath,
+          [{ resize: { width: 600 } }],
+          { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+        );
+
+        const base64 = manipResult.base64;
+        
+        if (!base64) {
+          console.warn('[Camera] Failed to generate base64');
+          return;
+        }
 
         this.frameCount++;
         console.log(`[Camera] Frame #${this.frameCount} captured, size: ${(base64.length / 1024).toFixed(1)}KB`);
