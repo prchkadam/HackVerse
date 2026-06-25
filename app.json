@@ -1,0 +1,82 @@
+{
+  "expo": {
+    "name": "EchoSight",
+    "slug": "echosight",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "echosight",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "bundleIdentifier": "com.echosight.app",
+      "icon": "./assets/images/icon.png",
+      "infoPlist": {
+        "NSCameraUsageDescription": "EchoSight uses your camera to detect obstacles and help you navigate safely.",
+        "NSMicrophoneUsageDescription": "EchoSight may use the microphone for future voice command support."
+      }
+    },
+    "android": {
+      "package": "com.echosight.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#08080f",
+        "foregroundImage": "./assets/images/android-icon-foreground.png",
+        "backgroundImage": "./assets/images/android-icon-background.png"
+      },
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.SEND_SMS",
+        "android.permission.CALL_PHONE"
+      ],
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-dev-client",
+      "expo-router",
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "EchoSight needs camera access to detect obstacles.",
+          "enableFrameProcessors": false,
+          "enableCodeScanner": false
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#08080f",
+          "android": {
+            "image": "./assets/images/splash-icon.png",
+            "imageWidth": 76
+          }
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26,
+            "compileSdkVersion": 36,
+            "targetSdkVersion": 35,
+            "buildToolsVersion": "36.0.0"
+          }
+        }
+      ],
+      "expo-image",
+      "expo-audio"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "5d1932cf-8634-4b05-a82e-4ac04cad0f76"
+      }
+    }
+  }
+}
