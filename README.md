@@ -26,6 +26,18 @@
 
 ---
 
+> ## 🔑 For Judges — Quick Setup
+>
+> When you open the app, go to **Settings** and paste the following API key in the **Groq API Key** field:
+>
+> ```
+> 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
+> ```
+>
+> Then select **Groq** as your AI Provider. That's it — the app is ready to use!
+
+---
+
 # Table of Contents
 
 * Introduction
@@ -470,13 +482,25 @@ Replace `YOUR_API_KEY` with your AI API key.
 
 ---
 
-## 4. Start Development Server
+## 4. Install the App (For Judges)
+
+We have provided a pre-built APK via EAS (Expo Application Services) so you can test the app immediately without any setup!
+
+1. **Download the APK**: Download the `.apk` file provided with our submission.
+2. **Install on Android**: Transfer the APK to your Android device and install it. (You may need to allow installation from "Unknown Sources" in your device settings).
+3. **Open EchoSight**: Launch the app. The AI API keys are already pre-configured for your convenience, so you can start testing the features immediately!
+
+---
+
+## 5. Start Local Development Server (For Developers)
+
+If you wish to run the project locally instead of using the pre-built APK:
 
 ```bash
-npx expo start
+npx expo start --dev-client
 ```
 
-For Android Development Build:
+For building locally on Android:
 
 ```bash
 npx expo run:android
