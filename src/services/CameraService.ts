@@ -19,6 +19,24 @@ export class CameraService {
   private intervalRef: ReturnType<typeof setInterval> | null = null;
   private capturing:   boolean = false;
   private frameCount:  number  = 0;
+  private isCapturingPhoto: boolean = false;
+
+  /**
+   * Safe wrapper around takePhoto to prevent concurrent capture sessions.
+   */
+  async safeTakePhoto(cameraRef: React.RefObject<Camera>, options: any): Promise<any> {
+    if (!cameraRef.current) return null;
+    if (this.isCapturingPhoto) {
+      console.log('[Camera] Blocked concurrent takePhoto call to prevent session crash');
+      throw new Error('Camera is currently busy capturing a photo.');
+    }
+    this.isCapturingPhoto = true;
+    try {
+      return await cameraRef.current.takePhoto(options);
+    } finally {
+      this.isCapturingPhoto = false;
+    }
+  }
 
   /**
    * Start the capture interval using the provided camera ref.
@@ -61,9 +79,10 @@ export class CameraService {
     if (!this.capturing || !cameraRef.current) return;
 
     try {
-      const photo = await cameraRef.current.takePhoto({
+      const photo = await this.safeTakePhoto(cameraRef, {
         enableShutterSound: false,
       });
+      if (!photo) return;
 
       let localPath = photo.path;
       if (!localPath.startsWith('file://') && !localPath.startsWith('http')) {
@@ -101,6 +120,7 @@ export class CameraService {
       clearInterval(this.intervalRef);
       this.intervalRef = null;
     }
+    this.isCapturingPhoto = false;
     // Camera service cleaned up
   }
 

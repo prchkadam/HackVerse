@@ -187,15 +187,11 @@ export class FeatherlessVisionService {
   async analyzeOcrFrame(base64Jpeg: string): Promise<string | null> {
     return this._sendCustomFrame(
       base64Jpeg,
-      'You are assisting a blind user. Look closely at the image.\n\n' +
-        '1. IF YOU SEE TEXT: Transcribe any visible text verbatim. Be highly accurate.\n' +
-        '2. IF YOU SEE A CURRENCY BANKNOTE: Follow these CRITICAL RULES FOR COUNTING:\n' +
-        '   - A single physical banknote has its denomination printed MULTIPLE TIMES. Do NOT count these as multiple bills. It is just ONE bill.\n' +
-        '   - THE BEST WAY TO COUNT: Count the central PORTRAITS (the historical figures/faces). Every banknote has exactly ONE portrait. If you see 7 faces, there are exactly 7 notes. Count the faces!\n' +
-        '   - Alternatively, count the distinct rectangular paper boundaries.\n' +
-        '   - Output a single line in this EXACT format BEFORE your transcription:\n' +
-        '     NOTES: {"total_bills": <number>, "bills": [{"denomination": <value>, "currency": "<name>", "count": <how_many_of_this_type>}]}\n\n' +
-        'If there is absolutely no text and no currency, output exactly: "No text detected".',
+      'You are assisting a blind user. Your primary task is to read all visible text verbatim.\n\n' +
+        '1. If there is text, read it aloud. Be highly accurate.\n' +
+        '2. If (and ONLY if) you see CURRENCY BANKNOTES, you must also count the faces/portraits on the bills, and append this exact JSON block at the VERY END of your response:\n' +
+        'NOTES: {"bills": [{"denomination": 100, "currency": "US Dollar", "count": 1}]}\n\n' +
+        'If there is no text and no currency, output exactly: "No text detected".',
       4096
     );
   }

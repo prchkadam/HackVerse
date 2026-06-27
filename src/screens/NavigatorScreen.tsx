@@ -85,6 +85,11 @@ const announce = (text: string, interrupt: boolean = true) => {
   ttsService.speak(text, 'normal');
 };
 
+const numberToWord = (num: number): string => {
+  const words = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+  return words[num] || num.toString();
+};
+
 export function NavigatorScreen() {
   const router    = useRouter();
   const dotAnim   = React.useMemo(() => new Animated.Value(1), []);
@@ -148,6 +153,10 @@ export function NavigatorScreen() {
   // Offline mode state
   const [isOffline, setIsOffline] = React.useState(false);
 
+  // Motion-adaptive scanning state & refs
+  const staticTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isThrottledRef = useRef<boolean>(false);
+
   // ── VisionCamera v4 hooks (Skipped on Web) ─────────────────────────────────
   const isWeb = Platform.OS === 'web';
   
@@ -156,6 +165,11 @@ export function NavigatorScreen() {
   // eslint-disable-next-line react-hooks/rules-of-hooks
   const deviceRaw = useCameraDevice('back');
   const device = React.useMemo(() => isWeb ? { id: 'mock' } as any : deviceRaw, [isWeb, deviceRaw]);
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const format = isWeb ? undefined : useCameraFormat(device, [
+    { videoResolution: { width: 1280, height: 720 } },
+    { fps: 30 }
+  ]);
   const cameraRef = useRef<Camera>(null) as React.RefObject<Camera>;
 
   // ── AppState tracker for Camera (Prevents background camera crashes) ────────
@@ -195,7 +209,9 @@ export function NavigatorScreen() {
     const unique = Array.from(new Set(detectedIndices));
     const labels = unique.map(i => COCO_LABELS[i]).filter(Boolean);
     if (labels.length > 0) {
-      announce(`Detected: ${labels.join(', ')}`, false);
+      console.log('[OfflineDetection] Speaking:', labels.join(', '));
+      ttsService.stop();
+      ttsService.speak(`Detected: ${labels.join(', ')}`, 'normal');
     }
   }, []);
 
@@ -212,10 +228,10 @@ export function NavigatorScreen() {
       dataType: 'uint8',
     });
 
-    const inputBuffer = resized.buffer.slice(
-      resized.byteOffset,
-      resized.byteOffset + resized.byteLength
-    );
+    // Avoid copying the buffer if it is already aligned
+    const inputBuffer = (resized.byteOffset === 0 && resized.byteLength === resized.buffer.byteLength)
+      ? resized.buffer
+      : resized.buffer.slice(resized.byteOffset, resized.byteOffset + resized.byteLength);
 
     // EfficientDet outputs: [boxes, classes, scores, num_detections]
     const outputs = tflite.runSync([inputBuffer as ArrayBuffer]);
@@ -240,7 +256,7 @@ export function NavigatorScreen() {
 
         const now = Date.now();
         // Throttle to every 3 seconds to avoid spamming the user
-        if (detected.length > 0 && now - lastAnnouncedTime.value > 3000) {
+        if (detected.length > 0 && now - lastAnnouncedTime.value > 2000) {
           lastAnnouncedTime.value = now;
           runOnJS(handleDetectedObjects)(detected);
         }
@@ -427,7 +443,8 @@ export function NavigatorScreen() {
     Object.entries(currGroupedForDesc).forEach(([key, count]) => {
       const [valueStr, currency] = key.split('_');
       const noteSuffix = count === 1 ? 'note' : 'notes';
-      denomDescriptions.push(`${count} ${valueStr} ${currency} ${noteSuffix}`);
+      const countWord = numberToWord(count);
+      denomDescriptions.push(`${countWord} ${noteSuffix} of ${valueStr} ${currency}`);
     });
 
     let announcement = `Added ${denomDescriptions.join(', ')}. Total amount is ${totalsStr}.`;
@@ -631,6 +648,38 @@ export function NavigatorScreen() {
     }
   }, [processDescription, setResponseLatency]);
 
+  const startCameraScan = useCallback((interval: number) => {
+    const state = motionStateRef.current;
+    if (state.provider === 'gemini') {
+      cameraService.start(cameraRef, interval, (base64Jpeg) => {
+        if (specialModeRef.current !== 'none') return;
+        latestSnapshotRef.current = motionService.getSnapshot();
+        geminiService.sendFrame(base64Jpeg);
+      });
+    } else if (state.provider === 'groq') {
+      cameraService.start(cameraRef, interval, (base64Jpeg) => {
+        if (specialModeRef.current !== 'none') return;
+        const snapshot = motionService.getSnapshot();
+        handleGroqFrame(base64Jpeg, snapshot);
+      });
+    } else {
+      cameraService.start(cameraRef, interval, (base64Jpeg) => {
+        if (specialModeRef.current !== 'none') return;
+        const snapshot = motionService.getSnapshot();
+        handleFeatherlessFrame(base64Jpeg, snapshot);
+      });
+    }
+  }, [handleGroqFrame, handleFeatherlessFrame]);
+
+  const resumeBackgroundScanning = useCallback(() => {
+    setSpecialMode('none');
+    specialModeRef.current = 'none';
+    if (isScanning && connectionStatus === 'connected') {
+      console.log('[Camera] Resuming background scanning...');
+      startCameraScan(scanInterval);
+    }
+  }, [isScanning, connectionStatus, scanInterval, startCameraScan]);
+
   // ── Start scanning ────────────────────────────────────────────────────────
   const startScanning = useCallback(async () => {
     // Reset note counter on scan start
@@ -669,33 +718,21 @@ export function NavigatorScreen() {
         console.log(`[EchoSight] Connecting to Gemini (${useFastMode ? 'text-only/fast' : 'native audio'})...`);
         await geminiService.connect(apiKey);
         console.log('[EchoSight] Connected! Starting camera capture...');
-        cameraService.start(cameraRef, scanInterval, (base64Jpeg) => {
-          if (specialModeRef.current !== 'none') return;
-          latestSnapshotRef.current = motionService.getSnapshot();
-          geminiService.sendFrame(base64Jpeg);
-        });
+        startCameraScan(scanInterval);
       } else if (aiProvider === 'groq') {
         // ── Groq path ──
         groqService.setApiKey(groqApiKey);
         groqService.setModel(groqModel);
         setConnectionStatus('connected');
         console.log(`[EchoSight] Groq ready (${groqModel}). Starting camera...`);
-        cameraService.start(cameraRef, scanInterval, (base64Jpeg) => {
-          if (specialModeRef.current !== 'none') return;
-          const snapshot = motionService.getSnapshot();
-          handleGroqFrame(base64Jpeg, snapshot);
-        });
+        startCameraScan(scanInterval);
       } else {
         // ── Featherless path ──
         featherlessService.setApiKey(featherlessApiKey);
         featherlessService.setModel(featherlessModel);
         setConnectionStatus('connected');
         console.log(`[EchoSight] Featherless ready (${featherlessModel}). Starting camera...`);
-        cameraService.start(cameraRef, scanInterval, (base64Jpeg) => {
-          if (specialModeRef.current !== 'none') return;
-          const snapshot = motionService.getSnapshot();
-          handleFeatherlessFrame(base64Jpeg, snapshot);
-        });
+        startCameraScan(scanInterval);
       }
 
       console.log('[EchoSight] Camera capture started');
@@ -716,6 +753,12 @@ export function NavigatorScreen() {
 
   // ── Stop scanning ─────────────────────────────────────────────────────────
   const stopScanning = useCallback((silent: boolean = false) => {
+    if (staticTimeoutRef.current) {
+      clearTimeout(staticTimeoutRef.current);
+      staticTimeoutRef.current = null;
+    }
+    isThrottledRef.current = false;
+
     // Reset note counter on scan stop
     noteCountRef.current = 0;
     currencyTotalsRef.current = {};
@@ -774,6 +817,20 @@ export function NavigatorScreen() {
   useEffect(() => {
     motionService.onMovementStart = () => {
       console.log('[Motion] Movement started! Cancelling in-flight requests.');
+      if (staticTimeoutRef.current) {
+        clearTimeout(staticTimeoutRef.current);
+        staticTimeoutRef.current = null;
+      }
+
+      if (isThrottledRef.current) {
+        isThrottledRef.current = false;
+        console.log('[Motion] Resuming normal scanning rate:', motionStateRef.current.interval, 'ms');
+        const state = motionStateRef.current;
+        if (state.status === 'connected' && specialModeRef.current === 'none') {
+          startCameraScan(state.interval);
+        }
+      }
+
       if (specialModeRef.current === 'none') {
         featherlessService.cancel();
         groqService.cancel();
@@ -783,7 +840,27 @@ export function NavigatorScreen() {
     motionService.onMovementStopped = () => {
       console.log('[Motion] Movement settled! Forcing predictive capture.');
       const state = motionStateRef.current;
+
+      // Set static timeout of 10s. If we remain stationary, throttle scan rate.
+      if (staticTimeoutRef.current) {
+        clearTimeout(staticTimeoutRef.current);
+      }
+      staticTimeoutRef.current = setTimeout(() => {
+        const currentState = motionStateRef.current;
+        if (specialModeRef.current === 'none' && currentState.status === 'connected') {
+          console.log('[Motion] Long static period detected (10s idle). Throttling scanning to 10s.');
+          isThrottledRef.current = true;
+          startCameraScan(10000);
+        }
+      }, 10000);
+
       if (specialModeRef.current === 'none' && state.status === 'connected') {
+        // If we are currently throttled, unthrottle now because settling is part of a movement stop
+        if (isThrottledRef.current) {
+          isThrottledRef.current = false;
+          console.log('[Motion] Movement stopped, unthrottling scan interval.');
+        }
+
         if (state.provider === 'groq') {
           cameraService.triggerNow(cameraRef, state.interval, (base64Jpeg) => {
             if (specialModeRef.current !== 'none') return;
@@ -796,10 +873,16 @@ export function NavigatorScreen() {
             const snapshot = motionService.getSnapshot();
             state.featherless(base64Jpeg, snapshot);
           });
+        } else if (state.provider === 'gemini') {
+          cameraService.triggerNow(cameraRef, state.interval, (base64Jpeg) => {
+            if (specialModeRef.current !== 'none') return;
+            latestSnapshotRef.current = motionService.getSnapshot();
+            geminiService.sendFrame(base64Jpeg);
+          });
         }
       }
     };
-  }, []);
+  }, [startCameraScan]);
 
   // ── Instruction Loop (Repeats when paused) ────────────────────────────────
   useEffect(() => {
@@ -839,7 +922,11 @@ export function NavigatorScreen() {
       if (audioBase64 && cameraRef.current) {
         try {
           // Capture current frame
-          const photo = await cameraRef.current.takePhoto({ enableShutterSound: false });
+          const photo = await cameraService.safeTakePhoto(cameraRef, { enableShutterSound: false });
+          if (!photo) {
+            announce('Camera is busy. Please try again.');
+            return;
+          }
           let localPath = photo.path;
           if (!localPath.startsWith('file://') && !localPath.startsWith('http')) {
             localPath = `file://${localPath}`;
@@ -869,7 +956,8 @@ export function NavigatorScreen() {
     if (cachedAudio && cameraRef.current) {
       setIsListening(false);
       try {
-        const photo = await cameraRef.current.takePhoto({ enableShutterSound: false });
+        const photo = await cameraService.safeTakePhoto(cameraRef, { enableShutterSound: false });
+        if (!photo) return;
         let localPath = photo.path;
         if (!localPath.startsWith('file://') && !localPath.startsWith('http')) {
           localPath = `file://${localPath}`;
@@ -963,8 +1051,7 @@ export function NavigatorScreen() {
         if (specialModeRef.current !== 'none') {
           // Cancel reading/detailed mode instantly
           announce('Cancelled. Resuming normal scan.');
-          setSpecialMode('none');
-          specialModeRef.current = 'none';
+          resumeBackgroundScanning();
           featherlessService.cancel();
           groqService.cancel();
         } else if (isScanning) {
@@ -986,15 +1073,18 @@ export function NavigatorScreen() {
   const captureCurrentFrame = useCallback(async (targetWidth?: number, quality: number = 0.7): Promise<string | null> => {
     if (!cameraRef.current) return null;
     try {
-      const photo = await cameraRef.current.takePhoto({ enableShutterSound: true });
+      const photo = await cameraService.safeTakePhoto(cameraRef, { enableShutterSound: true });
+      if (!photo) return null;
       let localPath = photo.path;
       if (!localPath.startsWith('file://') && !localPath.startsWith('http')) {
         localPath = `file://${localPath}`;
       }
-      
+
+      // First resize to targetWidth if specified
+      const ops: any[] = targetWidth ? [{ resize: { width: targetWidth } }] : [];
       const manipResult = await ImageManipulator.manipulateAsync(
         localPath,
-        targetWidth ? [{ resize: { width: targetWidth } }] : [],
+        ops,
         { compress: quality, format: ImageManipulator.SaveFormat.JPEG, base64: true }
       );
       
@@ -1002,6 +1092,48 @@ export function NavigatorScreen() {
       return manipResult.base64 || null;
     } catch (err) {
       console.warn('[Camera] Single frame capture failed:', err);
+      return null;
+    }
+  }, []);
+
+  /**
+   * Capture a frame cropped to the center 60% of the image.
+   * This approximates the visible screen viewport, excluding peripheral camera FOV.
+   */
+  const captureCroppedFrame = useCallback(async (quality: number = 0.7): Promise<string | null> => {
+    if (!cameraRef.current) return null;
+    try {
+      const photo = await cameraService.safeTakePhoto(cameraRef, { enableShutterSound: true });
+      if (!photo) return null;
+      let localPath = photo.path;
+      if (!localPath.startsWith('file://') && !localPath.startsWith('http')) {
+        localPath = `file://${localPath}`;
+      }
+
+      // Get the true loaded dimensions after EXIF rotation has been applied by Expo
+      const initial = await ImageManipulator.manipulateAsync(localPath, [], { format: ImageManipulator.SaveFormat.JPEG });
+      const photoW = initial.width;
+      const photoH = initial.height;
+
+      // Crop to center 60% — this closely matches what's visible on the phone screen
+      const cropW = Math.round(photoW * 0.6);
+      const cropH = Math.round(photoH * 0.6);
+      const originX = Math.round((photoW - cropW) / 2);
+      const originY = Math.round((photoH - cropH) / 2);
+
+      const manipResult = await ImageManipulator.manipulateAsync(
+        localPath,
+        [
+          { crop: { originX, originY, width: cropW, height: cropH } },
+          { resize: { width: 1080 } },
+        ],
+        { compress: quality, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+      );
+
+      await FileSystem.deleteAsync(localPath, { idempotent: true }).catch(() => {});
+      return manipResult.base64 || null;
+    } catch (err) {
+      console.warn('[Camera] Cropped frame capture failed:', err);
       return null;
     }
   }, []);
@@ -1019,12 +1151,13 @@ export function NavigatorScreen() {
     hapticService.triggerConfirmation();
     setSpecialMode('detailed');
     specialModeRef.current = 'detailed';
+    cameraService.stop(); // Stop background scanning during detailed scan
     announce('Detailed scan. Describing your surroundings.');
 
     // Wait 3s to let the TTS finish speaking before the native shutter sound interrupts it
     setTimeout(async () => {
-      // Detailed scan: Medium compression (1080px width, 70% quality)
-      const frame = await captureCurrentFrame(1080, 0.7);
+      // Detailed scan: High compression (640px width, 0.5 quality) for faster upload/processing
+      const frame = await captureCurrentFrame(640, 0.5);
       if (frame) {
         announce('Photo captured. Analyzing scene...');
         let success = false;
@@ -1055,17 +1188,14 @@ export function NavigatorScreen() {
         // If successful, give the TTS 5 seconds to finish speaking before resuming background scans
         if (success) {
           setTimeout(() => {
-            setSpecialMode('none');
-            specialModeRef.current = 'none';
+            resumeBackgroundScanning();
           }, 5000);
         } else {
           // If failed, resume background scans instantly
-          setSpecialMode('none');
-          specialModeRef.current = 'none';
+          resumeBackgroundScanning();
         }
       } else {
-        setSpecialMode('none');
-        specialModeRef.current = 'none';
+        resumeBackgroundScanning();
       }
     }, 3000);
   }, [isScanning, connectionStatus, captureCurrentFrame]);
@@ -1079,6 +1209,7 @@ export function NavigatorScreen() {
     hapticService.triggerConfirmation();
     setSpecialMode('ocr');
     specialModeRef.current = 'ocr';
+    cameraService.stop(); // Stop background scanning during OCR
     announce('Reading text. Please point camera at the text now.');
 
     // Wait 3s to let the user point the phone and the TTS to finish before capturing
@@ -1088,7 +1219,7 @@ export function NavigatorScreen() {
       // OFFLINE OCR LOGIC
       if (isOffline) {
         try {
-          const frameBase64 = await captureCurrentFrame(1080, 0.7);
+          const frameBase64 = await captureCroppedFrame(0.8);
           if (frameBase64) {
             announce('Photo captured. Reading text offline...');
             const tempFile = `${FileSystem.cacheDirectory}temp_ocr_${Date.now()}.jpg`;
@@ -1108,15 +1239,14 @@ export function NavigatorScreen() {
           announce('Offline reading failed.');
         }
         setTimeout(() => {
-          setSpecialMode('none');
-          specialModeRef.current = 'none';
+          resumeBackgroundScanning();
         }, 5000);
         return;
       }
 
       // ONLINE OCR & CURRENCY LOGIC
-      // OCR scan: Medium-high resolution to avoid API payload size limits (1080px width, 70% quality)
-      const frame = await captureCurrentFrame(1080, 0.7);
+      // Crop to center 60% of the viewport and send to online OCR/Currency APIs
+      const frame = await captureCroppedFrame(0.8);
       if (frame) {
         announce('Photo captured. Analyzing text...');
         let success = false;
@@ -1151,20 +1281,17 @@ export function NavigatorScreen() {
         // If successful, give the TTS 5 seconds to finish speaking before resuming background scans
         if (success) {
           setTimeout(() => {
-            setSpecialMode('none');
-            specialModeRef.current = 'none';
+            resumeBackgroundScanning();
           }, 5000);
         } else {
           // If failed, resume background scans instantly
-          setSpecialMode('none');
-          specialModeRef.current = 'none';
+          resumeBackgroundScanning();
         }
       } else {
-        setSpecialMode('none');
-        specialModeRef.current = 'none';
+        resumeBackgroundScanning();
       }
     }, 3000);
-  }, [isScanning, connectionStatus, captureCurrentFrame, isOffline]);
+  }, [isScanning, connectionStatus, captureCurrentFrame, captureCroppedFrame, isOffline]);
 
   // ── PanResponder for reliable swipe gesture detection ──────────────────
   const panResponder = React.useMemo(
@@ -1249,6 +1376,7 @@ export function NavigatorScreen() {
           isActive={isScanning && appState === 'active'}
           photo={true}
           frameProcessor={frameProcessor}
+          format={format}
         />
       )}
 
