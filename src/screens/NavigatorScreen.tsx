@@ -228,8 +228,13 @@ export function NavigatorScreen() {
         const numDetections = numDetectionsArray[0];
         const detected = [];
         for (let i = 0; i < numDetections; i++) {
-          if (scores[i] > 0.55) {
-            detected.push(Math.round(classes[i]));
+          if (scores[i] > 0.40) {
+            let classIdx = Math.round(classes[i]);
+            // If out of bounds or 1-indexed, shift down
+            if (!COCO_LABELS[classIdx] && COCO_LABELS[classIdx - 1]) {
+              classIdx = classIdx - 1;
+            }
+            detected.push(classIdx);
           }
         }
 
@@ -968,6 +973,10 @@ export function NavigatorScreen() {
       announce('Start scanning first to use detailed description.');
       return;
     }
+    if (isOffline) {
+      announce('Detailed analysis requires an internet connection.');
+      return;
+    }
     hapticService.triggerConfirmation();
     setSpecialMode('detailed');
     specialModeRef.current = 'detailed';
@@ -1040,16 +1049,19 @@ export function NavigatorScreen() {
       // OFFLINE OCR LOGIC
       if (isOffline) {
         try {
-          const photo = await cameraRef.current?.takePhoto({ enableShutterSound: true });
-          if (photo) {
+          const frameBase64 = await captureCurrentFrame(1080, 0.7);
+          if (frameBase64) {
             announce('Photo captured. Reading text offline...');
-            const text = await offlineOcrService.recognizeText(`file://${photo.path}`);
+            const tempFile = `${FileSystem.cacheDirectory}temp_ocr_${Date.now()}.jpg`;
+            await FileSystem.writeAsStringAsync(tempFile, frameBase64, { encoding: FileSystem.EncodingType.Base64 });
+
+            const text = await offlineOcrService.recognizeText(tempFile);
             if (text && text.trim().length > 0) {
               ttsService.speak(text, 'normal');
             } else {
               announce('No text detected.');
             }
-            FileSystem.deleteAsync(`file://${photo.path}`, { idempotent: true }).catch(() => {});
+            FileSystem.deleteAsync(tempFile, { idempotent: true }).catch(() => {});
           } else {
              announce('Failed to capture frame.');
           }
