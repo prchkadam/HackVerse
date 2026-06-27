@@ -43,6 +43,7 @@ export class FeatherlessVisionService {
   private model: string = FEATHERLESS_MODELS[0].id;
   private abortController: AbortController | null = null;
   private isProcessing: boolean = false;
+  private rateLimitUntil: number = 0;
 
   onStatusChange: StatusCallback = () => { };
 
@@ -75,6 +76,11 @@ export class FeatherlessVisionService {
     // Skip this frame if we are already processing one to avoid flooding the server
     if (this.isProcessing) {
       console.log('[Featherless] Skipping frame — still processing previous request');
+      return null;
+    }
+
+    if (Date.now() < this.rateLimitUntil) {
+      console.log(`[Featherless] Skipping frame — rate limited for ${Math.ceil((this.rateLimitUntil - Date.now()) / 1000)}s`);
       return null;
     }
 
@@ -131,6 +137,24 @@ export class FeatherlessVisionService {
       if (!response.ok) {
         const errorBody = await response.text().catch(() => 'unknown');
         console.warn(`[Featherless] API error ${response.status}:`, errorBody);
+
+        if (response.status === 429) {
+          let backoffMs = 5000;
+          const retryAfter = response.headers.get('retry-after');
+          if (retryAfter) {
+            const parsed = parseInt(retryAfter, 10);
+            if (!isNaN(parsed)) backoffMs = parsed * 1000;
+          } else {
+            const matchS = errorBody.match(/try again in ([\d\.]+)s/);
+            if (matchS && matchS[1]) backoffMs = parseFloat(matchS[1]) * 1000;
+            else {
+              const matchMs = errorBody.match(/try again in ([\d\.]+)ms/);
+              if (matchMs && matchMs[1]) backoffMs = parseFloat(matchMs[1]);
+            }
+          }
+          this.rateLimitUntil = Date.now() + backoffMs + 1000; // Add 1s padding
+        }
+
         this.onStatusChange('error');
         return null;
       }
@@ -198,6 +222,11 @@ export class FeatherlessVisionService {
       this.cancel();
     }
 
+    if (Date.now() < this.rateLimitUntil) {
+      console.log(`[Featherless] Custom request blocked — rate limited for ${Math.ceil((this.rateLimitUntil - Date.now()) / 1000)}s`);
+      return null;
+    }
+
     this.isProcessing = true;
     this.abortController = new AbortController();
     this.onStatusChange('processing');
@@ -240,6 +269,24 @@ export class FeatherlessVisionService {
       if (!response.ok) {
         const errorBody = await response.text().catch(() => 'unknown');
         console.warn(`[Featherless] Custom API error ${response.status}:`, errorBody);
+
+        if (response.status === 429) {
+          let backoffMs = 5000;
+          const retryAfter = response.headers.get('retry-after');
+          if (retryAfter) {
+            const parsed = parseInt(retryAfter, 10);
+            if (!isNaN(parsed)) backoffMs = parsed * 1000;
+          } else {
+            const matchS = errorBody.match(/try again in ([\d\.]+)s/);
+            if (matchS && matchS[1]) backoffMs = parseFloat(matchS[1]) * 1000;
+            else {
+              const matchMs = errorBody.match(/try again in ([\d\.]+)ms/);
+              if (matchMs && matchMs[1]) backoffMs = parseFloat(matchMs[1]);
+            }
+          }
+          this.rateLimitUntil = Date.now() + backoffMs + 1000;
+        }
+
         this.onStatusChange('error');
         return null;
       }
