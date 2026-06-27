@@ -56,6 +56,14 @@ import { emergencyService }        from '../services/EmergencyService';
 import { batteryService }          from '../services/BatteryService';
 import * as FileSystem             from 'expo-file-system/legacy';
 import * as ImageManipulator       from 'expo-image-manipulator';
+import NetInfo                     from '@react-native-community/netinfo';
+import { useTensorflowModel }      from 'react-native-fast-tflite';
+import { useFrameProcessor }       from 'react-native-vision-camera';
+import { useSharedValue, runOnJS } from 'react-native-reanimated';
+import { offlineOcrService }       from '../services/OfflineOcrService';
+import { COCO_LABELS }             from '../utils/cocoLabels';
+
+const TFLITE_MODEL = require('../../assets/models/efficientdet_lite0.tflite');
 
 const { height: SH } = Dimensions.get('window');
 
@@ -125,15 +133,18 @@ export function NavigatorScreen() {
   // Note counter state & refs
   const [noteCount, setNoteCount] = React.useState<number>(0);
   const [currencyTotals, setCurrencyTotals] = React.useState<Record<string, number>>({});
-  const [currentFrameTotals, setCurrentFrameTotals] = React.useState<Record<string, number>>({});
+  const [scannedNotesHistory, setScannedNotesHistory] = React.useState<Array<{ value: number; currency: string }>>([]);
   const noteCountRef = useRef<number>(0);
   const currencyTotalsRef = useRef<Record<string, number>>({});
-  const lastVisibleNotesRef = useRef<Array<{ value: number; currency: string }>>([]);
+  const historyRef = useRef<Array<{ value: number; currency: string }>>([]);
 
   // Fall detection countdown state
   const [showFallBanner, setShowFallBanner] = React.useState<boolean>(false);
   const [isSilenced, setIsSilenced] = React.useState<boolean>(false);
   const fallTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Offline mode state
+  const [isOffline, setIsOffline] = React.useState(false);
 
   // ── VisionCamera v4 hooks (Skipped on Web) ─────────────────────────────────
   const isWeb = Platform.OS === 'web';
@@ -148,11 +159,70 @@ export function NavigatorScreen() {
   // ── AppState tracker for Camera (Prevents background camera crashes) ────────
   const [appState, setAppState] = React.useState(AppState.currentState);
   useEffect(() => {
-    const subscription = AppState.addEventListener('change', nextAppState => {
-      setAppState(nextAppState);
-    });
-    return () => subscription.remove();
+    const sub = AppState.addEventListener('change', next => setAppState(next));
+    return () => sub.remove();
   }, []);
+
+  // ── Network State Listener ──────────────────────────────────────────────────
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(state => {
+      const offline = state.isConnected === false;
+      if (offline && !isOffline) {
+        ttsService.speak('Connection lost. Switching to offline mode.', 'normal');
+      } else if (!offline && isOffline) {
+        ttsService.speak('Connection restored. Online mode activated.', 'normal');
+      }
+      setIsOffline(offline);
+    });
+    return () => unsubscribe();
+  }, [isOffline]);
+
+  // ── Offline Object Detection (TFLite Frame Processor) ─────────────────────
+  const objectDetectionPlugin = useTensorflowModel(TFLITE_MODEL, []);
+  const lastAnnouncedTime = useSharedValue(0);
+
+  const handleDetectedObjects = useCallback((detectedIndices: number[]) => {
+    const unique = Array.from(new Set(detectedIndices));
+    const labels = unique.map(i => COCO_LABELS[i]).filter(Boolean);
+    if (labels.length > 0) {
+      announce(`Detected: ${labels.join(', ')}`, false);
+    }
+  }, []);
+
+  const frameProcessor = useFrameProcessor((frame) => {
+    'worklet';
+    if (!isOffline || !isScanning) return;
+
+    if (objectDetectionPlugin.state === 'loaded') {
+      // EfficientDet outputs: [boxes, classes, scores, num_detections]
+      const outputs = objectDetectionPlugin.model.runSync([frame as any]) as any[];
+      if (outputs && outputs.length >= 4) {
+        const scores = outputs[2] as Float32Array;
+        const classes = outputs[1] as Float32Array;
+        const numDetectionsArray = outputs[3] as Float32Array;
+        
+        if (numDetectionsArray && numDetectionsArray.length > 0) {
+          const numDetections = numDetectionsArray[0];
+          const detected = [];
+          for (let i = 0; i < numDetections; i++) {
+            if (scores[i] > 0.55) {
+              detected.push(Math.round(classes[i]));
+            }
+          }
+
+          const now = Date.now();
+          // Throttle to every 3 seconds to avoid spamming the user
+          if (detected.length > 0 && now - lastAnnouncedTime.value > 3000) {
+            lastAnnouncedTime.value = now;
+            runOnJS(handleDetectedObjects)(detected);
+          }
+        }
+      }
+    }
+  }, [objectDetectionPlugin.state, isOffline, isScanning, handleDetectedObjects]);
+
+  // ── Initialization ──────────────────────────────────────────────────────────
+
 
   // ── Load persisted settings + request permissions on mount ────────────────
   useEffect(() => {
@@ -258,8 +328,6 @@ export function NavigatorScreen() {
     }
 
     if (!jsonStr) {
-      setCurrentFrameTotals({});
-      lastVisibleNotesRef.current = [];
       return rawText;
     }
 
@@ -269,20 +337,17 @@ export function NavigatorScreen() {
       summary = JSON.parse(jsonStr);
     } catch {
       console.warn('[BanknoteDetection] Failed to parse NOTES JSON:', jsonStr);
-      setCurrentFrameTotals({});
-      lastVisibleNotesRef.current = [];
       return rawText;
     }
 
     if (!summary.bills || !Array.isArray(summary.bills) || summary.bills.length === 0) {
-      setCurrentFrameTotals({});
-      lastVisibleNotesRef.current = [];
-      return rawText;
+      let restOfText = rawText.replace(notesMatchStr, '').trim();
+      return restOfText || 'No text detected';
     }
 
     // 1. Build current frame notes from the AI's summary
     const currentFrameNotes: Array<{ value: number; currency: string }> = [];
-    const frameTotals: Record<string, number> = {};
+    const newTotals = { ...currencyTotalsRef.current };
 
     for (const bill of summary.bills) {
       // Standardize currency name
@@ -306,51 +371,18 @@ export function NavigatorScreen() {
       const count = bill.count || 1;
       for (let i = 0; i < count; i++) {
         currentFrameNotes.push({ value: bill.denomination, currency });
+        newTotals[currency] = (newTotals[currency] || 0) + bill.denomination;
+        noteCountRef.current += 1;
       }
-      frameTotals[currency] = (frameTotals[currency] || 0) + bill.denomination * count;
     }
 
-    setCurrentFrameTotals(frameTotals);
-
-    // 2. Place-and-Remove: compare current vs previous frame
-    const newTotals = { ...currencyTotalsRef.current };
-    const newlyScannedList: string[] = [];
-
-    const prevGrouped: Record<string, number> = {};
-    const currGrouped: Record<string, number> = {};
-
-    lastVisibleNotesRef.current.forEach(n => {
-      const key = `${n.value}_${n.currency}`;
-      prevGrouped[key] = (prevGrouped[key] || 0) + 1;
-    });
-
-    currentFrameNotes.forEach(n => {
-      const key = `${n.value}_${n.currency}`;
-      currGrouped[key] = (currGrouped[key] || 0) + 1;
-    });
-
-    Object.keys(currGrouped).forEach(key => {
-      const prevCount = prevGrouped[key] || 0;
-      const currCount = currGrouped[key];
-
-      if (currCount > prevCount) {
-        const addedCount = currCount - prevCount;
-        const [valueStr, currency] = key.split('_');
-        const value = parseInt(valueStr, 10);
-
-        for (let i = 0; i < addedCount; i++) {
-          noteCountRef.current += 1;
-          newTotals[currency] = (newTotals[currency] || 0) + value;
-          newlyScannedList.push(`${value} ${currency}`);
-        }
-      }
-    });
-
-    // Save states
-    lastVisibleNotesRef.current = currentFrameNotes;
+    // Save states (Cumulative memory)
+    const newHistory = [...historyRef.current, ...currentFrameNotes];
+    historyRef.current = newHistory;
     currencyTotalsRef.current = newTotals;
     setNoteCount(noteCountRef.current);
     setCurrencyTotals(newTotals);
+    setScannedNotesHistory(newHistory);
 
     // Build TTS announcement: count → total → per-note description
     const totalsStr = Object.entries(newTotals)
@@ -371,19 +403,7 @@ export function NavigatorScreen() {
       denomDescriptions.push(`${count} ${valueStr} ${currency} ${noteSuffix}`);
     });
 
-    // Extract rest of text (remove the NOTES line)
-    let restOfText = rawText.replace(notesMatchStr, '').replace(/no text detected/gi, '').trim();
-
-    // Announcement order: count → total → description of each denomination
-    let announcement = `${noteCountRef.current} ${noteCountRef.current === 1 ? 'note' : 'notes'} scanned. `;
-    announcement += `Total: ${totalsStr}. `;
-    if (denomDescriptions.length > 0) {
-      announcement += `Currently in view: ${denomDescriptions.join(', ')}. `;
-    }
-
-    if (restOfText && restOfText.length > 2) {
-      announcement += `Other text: ${restOfText}`;
-    }
+    let announcement = `Added ${denomDescriptions.join(', ')}. Total amount is ${totalsStr}.`;
 
     return announcement;
   }, []);
@@ -589,10 +609,10 @@ export function NavigatorScreen() {
     // Reset note counter on scan start
     noteCountRef.current = 0;
     currencyTotalsRef.current = {};
-    lastVisibleNotesRef.current = [];
+    historyRef.current = [];
     setNoteCount(0);
     setCurrencyTotals({});
-    setCurrentFrameTotals({});
+    setScannedNotesHistory([]);
 
     const activeKey = aiProvider === 'gemini' ? apiKey : (aiProvider === 'groq' ? groqApiKey : featherlessApiKey);
     
@@ -672,10 +692,10 @@ export function NavigatorScreen() {
     // Reset note counter on scan stop
     noteCountRef.current = 0;
     currencyTotalsRef.current = {};
-    lastVisibleNotesRef.current = [];
+    historyRef.current = [];
     setNoteCount(0);
     setCurrencyTotals({});
-    setCurrentFrameTotals({});
+    setScannedNotesHistory([]);
 
     cameraService.stop();
     motionService.stop();
@@ -993,8 +1013,36 @@ export function NavigatorScreen() {
 
     // Wait 3s to let the user point the phone and the TTS to finish before capturing
     setTimeout(async () => {
-      // OCR scan: Medium-high resolution to avoid API payload size limits (1080px width, 70% quality)
       latestSnapshotRef.current = motionService.getSnapshot();
+
+      // OFFLINE OCR LOGIC
+      if (isOffline) {
+        try {
+          const photo = await cameraRef.current?.takePhoto({ enableShutterSound: true });
+          if (photo) {
+            announce('Photo captured. Reading text offline...');
+            const text = await offlineOcrService.recognizeText(`file://${photo.path}`);
+            if (text && text.trim().length > 0) {
+              ttsService.speak(text, 'normal');
+            } else {
+              announce('No text detected.');
+            }
+            FileSystem.deleteAsync(`file://${photo.path}`, { idempotent: true }).catch(() => {});
+          } else {
+             announce('Failed to capture frame.');
+          }
+        } catch(e) {
+          announce('Offline reading failed.');
+        }
+        setTimeout(() => {
+          setSpecialMode('none');
+          specialModeRef.current = 'none';
+        }, 5000);
+        return;
+      }
+
+      // ONLINE OCR & CURRENCY LOGIC
+      // OCR scan: Medium-high resolution to avoid API payload size limits (1080px width, 70% quality)
       const frame = await captureCurrentFrame(1080, 0.7);
       if (frame) {
         announce('Photo captured. Analyzing text...');
@@ -1008,9 +1056,7 @@ export function NavigatorScreen() {
           if (text) {
             const processedText = handleBanknoteDetection(text);
             processDescription(processedText);
-            const finalText = processedText.toLowerCase().includes('no text detected') || processedText.toLowerCase().includes('notes scanned')
-              ? processedText
-              : `Text found: ${processedText}`;
+            const finalText = processedText;
             ttsService.speak(finalText, 'normal');
             success = true;
           } else {
@@ -1021,9 +1067,7 @@ export function NavigatorScreen() {
           if (text) {
             const processedText = handleBanknoteDetection(text);
             processDescription(processedText);
-            const finalText = processedText.toLowerCase().includes('no text detected') || processedText.toLowerCase().includes('notes scanned')
-              ? processedText
-              : `Text found: ${processedText}`;
+            const finalText = processedText;
             ttsService.speak(finalText, 'normal');
             success = true;
           } else {
@@ -1047,7 +1091,7 @@ export function NavigatorScreen() {
         specialModeRef.current = 'none';
       }
     }, 3000);
-  }, [isScanning, connectionStatus, captureCurrentFrame]);
+  }, [isScanning, connectionStatus, captureCurrentFrame, isOffline]);
 
   // ── PanResponder for reliable swipe gesture detection ──────────────────
   const panResponder = React.useMemo(
@@ -1131,6 +1175,7 @@ export function NavigatorScreen() {
           device={device}
           isActive={isScanning && appState === 'active'}
           photo={true}
+          frameProcessor={frameProcessor}
         />
       )}
 
@@ -1228,9 +1273,19 @@ export function NavigatorScreen() {
           accessibilityRole="summary"
           accessibilityLiveRegion="polite"
         >
-          <Text style={styles.noteCounterTitle}>💰 Note Counter</Text>
-          <Text style={styles.noteCounterCount}>Notes Scanned: {noteCount}</Text>
-          <Text style={styles.noteCounterTotal}>
+          <Text style={styles.noteCounterTitle}>💰 Currency Counter</Text>
+          <Text style={styles.noteCounterCount}>{noteCount} Notes Scanned</Text>
+          <View style={styles.noteCounterDivider} />
+          {scannedNotesHistory.slice(-3).map((note, idx) => (
+            <Text key={idx} style={styles.noteCounterDetail}>
+              + {note.value} {note.currency}
+            </Text>
+          ))}
+          {scannedNotesHistory.length > 3 && (
+            <Text style={{ color: '#a0a0c0', fontSize: 12 }}>...and {scannedNotesHistory.length - 3} more</Text>
+          )}
+          <View style={styles.noteCounterDivider} />
+          <Text style={styles.noteCounterGrandTotal}>
             Total: {Object.entries(currencyTotals).length > 0
               ? Object.entries(currencyTotals).map(([curr, tot]) => `${tot} ${curr}`).join(' | ')
               : '0'}

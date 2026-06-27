@@ -163,20 +163,22 @@ export class FeatherlessVisionService {
   async analyzeOcrFrame(base64Jpeg: string): Promise<string | null> {
     return this._sendCustomFrame(
       base64Jpeg,
-      'You are identifying currency banknotes for a blind user.\n\n' +
-        'CRITICAL RULES FOR COUNTING:\n' +
-        '1. A single physical banknote has its denomination printed MULTIPLE TIMES (e.g. US Dollars have values in all 4 corners and on both left and right sides). Do NOT count these as multiple bills. It is just ONE bill.\n' +
+      'You are assisting a blind user. Look closely at the image.\n\n' +
+        'If you see ANY currency banknote, follow these CRITICAL RULES FOR COUNTING:\n' +
+        '1. A single physical banknote has its denomination printed MULTIPLE TIMES. Do NOT count these as multiple bills. It is just ONE bill.\n' +
         '2. THE BEST WAY TO COUNT: Count the central PORTRAITS (the historical figures/faces). Every banknote has exactly ONE portrait. If you see 7 faces, there are exactly 7 notes. Count the faces!\n' +
         '3. Alternatively, count the distinct rectangular paper boundaries.\n' +
         '4. Do NOT count denomination text occurrences. You must count physical pieces of paper/faces.\n\n' +
         'STEP 1: Look at the image and count how many separate PORTRAITS / distinct paper rectangles you see.\n' +
-        'STEP 2: For each distinct bill you found, identify its denomination and currency.\n' +
-        'STEP 3: Output a single line in this exact format at the very beginning of your response:\n' +
-        'NOTES: {"total_bills": <number>, "bills": [{"denomination": <value>, "currency": "<name>", "count": <how_many_of_this_type>}]}\n\n' +
+        'STEP 2: For each distinct bill you found, identify its currency type and denomination.\n' +
+        'STEP 3: Output a single line in this EXACT format at the very beginning of your response:\n' +
+        'NOTES: {"total_bills": <number>, "bills": [{"denomination": <value>, "currency": "<name>", "count": <how_many_of_this_type>}]}\n' +
+        'STEP 4: CRITICAL: If you output a NOTES JSON, DO NOT transcribe any other text around the note. Stop immediately after the JSON.\n\n' +
         'Example — if you see exactly one 100 US Dollar bill and exactly one 50 US Dollar bill (total 2 faces/notes):\n' +
         'NOTES: {"total_bills": 2, "bills": [{"denomination": 100, "currency": "US Dollar", "count": 1}, {"denomination": 50, "currency": "US Dollar", "count": 1}]}\n\n' +
-        'After the NOTES line, transcribe any other visible non-currency text verbatim.\n' +
-        'If no banknotes are visible, do not output a NOTES line. Just transcribe any visible text, or output "No text detected".',
+        'If you DO NOT see any currency banknotes:\n' +
+        '1. Transcribe any visible text verbatim.\n' +
+        '2. If there is no text, output "No text detected".',
       4096
     );
   }
