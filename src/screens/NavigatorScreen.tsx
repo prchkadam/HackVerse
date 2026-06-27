@@ -60,6 +60,8 @@ import NetInfo                     from '@react-native-community/netinfo';
 import { useTensorflowModel }      from 'react-native-fast-tflite';
 import { useFrameProcessor }       from 'react-native-vision-camera';
 import { useSharedValue, runOnJS } from 'react-native-reanimated';
+import { NitroModules }            from 'react-native-nitro-modules';
+import { useResizePlugin }         from 'vision-camera-resize-plugin';
 import { offlineOcrService }       from '../services/OfflineOcrService';
 import { COCO_LABELS }             from '../utils/cocoLabels';
 
@@ -179,6 +181,14 @@ export function NavigatorScreen() {
 
   // ── Offline Object Detection (TFLite Frame Processor) ─────────────────────
   const objectDetectionPlugin = useTensorflowModel(TFLITE_MODEL, []);
+  const model = objectDetectionPlugin.state === 'loaded' ? objectDetectionPlugin.model : undefined;
+  
+  const boxedModel = React.useMemo(
+    () => (model != null ? NitroModules.box(model) : undefined),
+    [model]
+  );
+  const { resize } = useResizePlugin();
+
   const lastAnnouncedTime = useSharedValue(0);
 
   const handleDetectedObjects = useCallback((detectedIndices: number[]) => {
@@ -191,35 +201,47 @@ export function NavigatorScreen() {
 
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
-    if (!isOffline || !isScanning) return;
+    if (!isOffline || !isScanning || boxedModel == null) return;
 
-    if (objectDetectionPlugin.state === 'loaded') {
-      // EfficientDet outputs: [boxes, classes, scores, num_detections]
-      const outputs = objectDetectionPlugin.model.runSync([frame as any]) as any[];
-      if (outputs && outputs.length >= 4) {
-        const scores = outputs[2] as Float32Array;
-        const classes = outputs[1] as Float32Array;
-        const numDetectionsArray = outputs[3] as Float32Array;
-        
-        if (numDetectionsArray && numDetectionsArray.length > 0) {
-          const numDetections = numDetectionsArray[0];
-          const detected = [];
-          for (let i = 0; i < numDetections; i++) {
-            if (scores[i] > 0.55) {
-              detected.push(Math.round(classes[i]));
-            }
-          }
+    const tflite = boxedModel.unbox();
 
-          const now = Date.now();
-          // Throttle to every 3 seconds to avoid spamming the user
-          if (detected.length > 0 && now - lastAnnouncedTime.value > 3000) {
-            lastAnnouncedTime.value = now;
-            runOnJS(handleDetectedObjects)(detected);
+    // 1. Resize Frame to 320x320x3 for EfficientDet_lite0
+    const resized = resize(frame, {
+      scale: { width: 320, height: 320 },
+      pixelFormat: 'rgb',
+      dataType: 'uint8',
+    });
+
+    const inputBuffer = resized.buffer.slice(
+      resized.byteOffset,
+      resized.byteOffset + resized.byteLength
+    );
+
+    // EfficientDet outputs: [boxes, classes, scores, num_detections]
+    const outputs = tflite.runSync([inputBuffer as ArrayBuffer]);
+    if (outputs && outputs.length >= 4) {
+      const scores = new Float32Array(outputs[2]!);
+      const classes = new Float32Array(outputs[1]!);
+      const numDetectionsArray = new Float32Array(outputs[3]!);
+      
+      if (numDetectionsArray && numDetectionsArray.length > 0) {
+        const numDetections = numDetectionsArray[0];
+        const detected = [];
+        for (let i = 0; i < numDetections; i++) {
+          if (scores[i] > 0.55) {
+            detected.push(Math.round(classes[i]));
           }
+        }
+
+        const now = Date.now();
+        // Throttle to every 3 seconds to avoid spamming the user
+        if (detected.length > 0 && now - lastAnnouncedTime.value > 3000) {
+          lastAnnouncedTime.value = now;
+          runOnJS(handleDetectedObjects)(detected);
         }
       }
     }
-  }, [objectDetectionPlugin.state, isOffline, isScanning, handleDetectedObjects]);
+  }, [boxedModel, isOffline, isScanning, handleDetectedObjects, resize, lastAnnouncedTime]);
 
   // ── Initialization ──────────────────────────────────────────────────────────
 
