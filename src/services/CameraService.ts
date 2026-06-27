@@ -37,42 +37,61 @@ export class CameraService {
     this.frameCount  = 0;
     console.log('[Camera] Starting capture, interval:', intervalMs, 'ms');
 
-    this.intervalRef = setInterval(async () => {
-      if (!this.capturing || !cameraRef.current) return;
+    this.intervalRef = setInterval(() => this._capture(cameraRef, onFrame), intervalMs);
+  }
 
-      try {
-        const photo = await cameraRef.current.takePhoto({
-          enableShutterSound: false,
-        });
+  /**
+   * Instantly capture a frame, overriding the timer, and restart the interval.
+   */
+  triggerNow(
+    cameraRef: React.RefObject<Camera>,
+    intervalMs: number,
+    onFrame: FrameCallback,
+  ): void {
+    if (!this.capturing) return;
+    if (this.intervalRef) {
+      clearInterval(this.intervalRef);
+    }
+    console.log('[Camera] Triggering predictive capture based on motion...');
+    this._capture(cameraRef, onFrame);
+    this.intervalRef = setInterval(() => this._capture(cameraRef, onFrame), intervalMs);
+  }
 
-        let localPath = photo.path;
-        if (!localPath.startsWith('file://') && !localPath.startsWith('http')) {
-          localPath = `file://${localPath}`;
-        }
+  private async _capture(cameraRef: React.RefObject<Camera>, onFrame: FrameCallback) {
+    if (!this.capturing || !cameraRef.current) return;
 
-        // Compress background frames heavily for speed: 600px width, 50% quality
-        const manipResult = await ImageManipulator.manipulateAsync(
-          localPath,
-          [{ resize: { width: 600 } }],
-          { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG, base64: true }
-        );
+    try {
+      const photo = await cameraRef.current.takePhoto({
+        enableShutterSound: false,
+      });
 
-        const base64 = manipResult.base64;
-        
-        if (!base64) {
-          console.warn('[Camera] Failed to generate base64');
-          return;
-        }
-
-        this.frameCount++;
-        console.log(`[Camera] Frame #${this.frameCount} captured, size: ${(base64.length / 1024).toFixed(1)}KB`);
-        onFrame(base64);
-
-        await FileSystem.deleteAsync(localPath, { idempotent: true }).catch(() => {});
-      } catch (err) {
-        console.warn('[Camera] Frame capture failed:', err);
+      let localPath = photo.path;
+      if (!localPath.startsWith('file://') && !localPath.startsWith('http')) {
+        localPath = `file://${localPath}`;
       }
-    }, intervalMs);
+
+      // Compress background frames heavily for speed: 600px width, 50% quality
+      const manipResult = await ImageManipulator.manipulateAsync(
+        localPath,
+        [{ resize: { width: 600 } }],
+        { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+      );
+
+      const base64 = manipResult.base64;
+      
+      if (!base64) {
+        console.warn('[Camera] Failed to generate base64');
+        return;
+      }
+
+      this.frameCount++;
+      console.log(`[Camera] Frame #${this.frameCount} captured, size: ${(base64.length / 1024).toFixed(1)}KB`);
+      onFrame(base64);
+
+      await FileSystem.deleteAsync(localPath, { idempotent: true }).catch(() => {});
+    } catch (err) {
+      console.warn('[Camera] Frame capture failed:', err);
+    }
   }
 
   /** Stop capture interval */

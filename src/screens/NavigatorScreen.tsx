@@ -740,7 +740,25 @@ export function NavigatorScreen() {
     Vibration.vibrate(40);
   }, [setHazardWarning, setIsScanning, setLastDescription, setResponseLatency]);
 
-  // ── Motion cancellation listener ──────────────────────────────────────────
+  // ── Motion cancellation & Predictive Capture listener ───────────────────────
+  const motionStateRef = useRef({
+    provider: aiProvider,
+    interval: scanInterval,
+    groq: handleGroqFrame,
+    featherless: handleFeatherlessFrame,
+    status: connectionStatus,
+  });
+
+  useEffect(() => {
+    motionStateRef.current = {
+      provider: aiProvider,
+      interval: scanInterval,
+      groq: handleGroqFrame,
+      featherless: handleFeatherlessFrame,
+      status: connectionStatus,
+    };
+  }, [aiProvider, scanInterval, handleGroqFrame, handleFeatherlessFrame, connectionStatus]);
+
   useEffect(() => {
     if (isScanning) {
       motionService.start();
@@ -748,19 +766,40 @@ export function NavigatorScreen() {
       motionService.stop();
     }
 
-    motionService.onFastMovement = () => {
-      console.log('[Motion] High angular velocity detected! Cancelling in-flight requests.');
-      // Only cancel background frames. User-initiated scans (OCR/Detailed) should complete even if the user shakes the phone.
+    return () => {
+      motionService.stop();
+    };
+  }, [isScanning]);
+
+  useEffect(() => {
+    motionService.onMovementStart = () => {
+      console.log('[Motion] Movement started! Cancelling in-flight requests.');
       if (specialModeRef.current === 'none') {
         featherlessService.cancel();
         groqService.cancel();
       }
     };
 
-    return () => {
-      motionService.stop();
+    motionService.onMovementStopped = () => {
+      console.log('[Motion] Movement settled! Forcing predictive capture.');
+      const state = motionStateRef.current;
+      if (specialModeRef.current === 'none' && state.status === 'connected') {
+        if (state.provider === 'groq') {
+          cameraService.triggerNow(cameraRef, state.interval, (base64Jpeg) => {
+            if (specialModeRef.current !== 'none') return;
+            const snapshot = motionService.getSnapshot();
+            state.groq(base64Jpeg, snapshot);
+          });
+        } else if (state.provider === 'featherless') {
+          cameraService.triggerNow(cameraRef, state.interval, (base64Jpeg) => {
+            if (specialModeRef.current !== 'none') return;
+            const snapshot = motionService.getSnapshot();
+            state.featherless(base64Jpeg, snapshot);
+          });
+        }
+      }
     };
-  }, [isScanning]);
+  }, []);
 
   // ── Instruction Loop (Repeats when paused) ────────────────────────────────
   useEffect(() => {

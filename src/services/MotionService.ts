@@ -18,6 +18,7 @@ export interface OrientationSnapshot {
 export class MotionService {
   private subscription: any = null;
   private isListening = false;
+  private isMoving = false;
 
   // Cumulative orientation (pseudo-angles in radians)
   private currentYaw = 0;
@@ -28,8 +29,9 @@ export class MotionService {
   private readonly HIGH_VELOCITY_THRESHOLD = 1.5; // rad/s
   private readonly SIGNIFICANT_DRIFT_THRESHOLD = 0.35; // ~20 degrees in radians
 
-  // Callback for instant cancellation
-  onFastMovement: () => void = () => {};
+  // Callbacks for predictive capturing
+  onMovementStart: () => void = () => {};
+  onMovementStopped: () => void = () => {};
 
   start() {
     if (this.isListening || Platform.OS === 'web') return;
@@ -53,11 +55,18 @@ export class MotionService {
       this.currentYaw += data.y * dt;
       this.currentPitch += data.x * dt;
 
-      // Option 2: High Velocity Check
-      // If the user whips their head around fast, instantly abort
+      // Movement Tracking for Predictive Capture
       const magnitude = Math.sqrt(data.x * data.x + data.y * data.y + data.z * data.z);
-      if (magnitude > this.HIGH_VELOCITY_THRESHOLD) {
-        this.onFastMovement();
+      if (magnitude > 0.6) { // Moderate pan
+        if (!this.isMoving) {
+          this.isMoving = true;
+          this.onMovementStart();
+        }
+      } else if (magnitude < 0.2) { // Settled
+        if (this.isMoving) {
+          this.isMoving = false;
+          this.onMovementStopped();
+        }
       }
     });
 
