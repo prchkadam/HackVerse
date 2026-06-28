@@ -57,11 +57,19 @@ export class EmergencyService {
       console.warn('[Emergency] Failed to get location:', err);
     }
 
-    // 2. Build the SOS message (Keep it plain-text without URLs to bypass Indian carrier spam filters)
-    const message =
+    // 2. Build the SOS message
+    let message =
       `EMERGENCY: EchoSight Fall Detection\n\n` +
       `A possible fall has been detected for the EchoSight user.\n\n` +
-      `Location: ${locationText}\n\n` +
+      `Location: ${locationText}\n`;
+
+    if (mapsLink) {
+      message += `Google Maps Link: ${mapsLink}\n\n`;
+    } else {
+      message += `\n`;
+    }
+
+    message +=
       `This is an automated message from the EchoSight app. ` +
       `Please check on them immediately.`;
 

@@ -32,7 +32,11 @@ export class CameraService {
     }
     this.isCapturingPhoto = true;
     try {
-      return await cameraRef.current.takePhoto(options);
+      const takePhotoPromise = cameraRef.current.takePhoto(options);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Camera takePhoto timed out after 5 seconds')), 5000)
+      );
+      return await Promise.race([takePhotoPromise, timeoutPromise]);
     } finally {
       this.isCapturingPhoto = false;
     }

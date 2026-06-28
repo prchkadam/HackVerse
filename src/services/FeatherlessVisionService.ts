@@ -337,6 +337,10 @@ export class FeatherlessVisionService {
     this.onStatusChange('idle');
   }
 
+  getRateLimitUntil(): number {
+    return this.rateLimitUntil;
+  }
+
   get processing(): boolean {
     return this.isProcessing;
   }

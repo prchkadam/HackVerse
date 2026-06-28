@@ -59,13 +59,13 @@ import * as ImageManipulator       from 'expo-image-manipulator';
 import NetInfo                     from '@react-native-community/netinfo';
 import { useTensorflowModel }      from 'react-native-fast-tflite';
 import { useFrameProcessor }       from 'react-native-vision-camera';
-import { useSharedValue, runOnJS } from 'react-native-reanimated';
+import { Worklets, useSharedValue }  from 'react-native-worklets-core';
 import { NitroModules }            from 'react-native-nitro-modules';
 import { useResizePlugin }         from 'vision-camera-resize-plugin';
 import { offlineOcrService }       from '../services/OfflineOcrService';
-import { COCO_LABELS }             from '../utils/cocoLabels';
+import { COCO_LABELS, COCO_91 }    from '../utils/cocoLabels';
 
-const TFLITE_MODEL = require('../../assets/models/efficientdet_lite0.tflite');
+const TFLITE_MODEL = require('../../assets/models/ssd_mobilenet_v1.tflite');
 
 const { height: SH } = Dimensions.get('window');
 
@@ -145,6 +145,11 @@ export function NavigatorScreen() {
   const currencyTotalsRef = useRef<Record<string, number>>({});
   const historyRef = useRef<Array<{ value: number; currency: string }>>([]);
 
+  // Timeout refs to prevent orphaned background captures
+  const ocrTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const detailedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resumeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Fall detection countdown state
   const [showFallBanner, setShowFallBanner] = React.useState<boolean>(false);
   const [isSilenced, setIsSilenced] = React.useState<boolean>(false);
@@ -152,6 +157,47 @@ export function NavigatorScreen() {
 
   // Offline mode state
   const [isOffline, setIsOffline] = React.useState(false);
+
+  // Offline and rate limit tracking refs
+  const isNetworkOfflineRef = useRef(false);
+  const isRateLimitedRef = useRef(false);
+
+  // Reanimated Shared Values to prevent frameProcessor re-binding freezes
+  const isScanningSV = useSharedValue(false);
+  const isOfflineSV = useSharedValue(false);
+
+  useEffect(() => {
+    isScanningSV.value = isScanning;
+  }, [isScanning]);
+
+  useEffect(() => {
+    isOfflineSV.value = isOffline;
+  }, [isOffline]);
+
+  // ── Sync Refs to avoid stale closures in setTimeout/callbacks ──────────────
+  const isOfflineRef = useRef(isOffline);
+  const isScanningRef = useRef(isScanning);
+  const connectionStatusRef = useRef(connectionStatus);
+  const aiProviderRef = useRef(aiProvider);
+  const apiKeyRef = useRef(apiKey);
+  const groqApiKeyRef = useRef(groqApiKey);
+  const featherlessApiKeyRef = useRef(featherlessApiKey);
+  const groqModelRef = useRef(groqModel);
+  const featherlessModelRef = useRef(featherlessModel);
+  const useFastModeRef = useRef(useFastMode);
+  const scanIntervalRef = useRef(scanInterval);
+
+  useEffect(() => { isOfflineRef.current = isOffline; }, [isOffline]);
+  useEffect(() => { isScanningRef.current = isScanning; }, [isScanning]);
+  useEffect(() => { connectionStatusRef.current = connectionStatus; }, [connectionStatus]);
+  useEffect(() => { aiProviderRef.current = aiProvider; }, [aiProvider]);
+  useEffect(() => { apiKeyRef.current = apiKey; }, [apiKey]);
+  useEffect(() => { groqApiKeyRef.current = groqApiKey; }, [groqApiKey]);
+  useEffect(() => { featherlessApiKeyRef.current = featherlessApiKey; }, [featherlessApiKey]);
+  useEffect(() => { groqModelRef.current = groqModel; }, [groqModel]);
+  useEffect(() => { featherlessModelRef.current = featherlessModel; }, [featherlessModel]);
+  useEffect(() => { useFastModeRef.current = useFastMode; }, [useFastMode]);
+  useEffect(() => { scanIntervalRef.current = scanInterval; }, [scanInterval]);
 
   // Motion-adaptive scanning state & refs
   const staticTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -181,17 +227,60 @@ export function NavigatorScreen() {
 
   // ── Network State Listener ──────────────────────────────────────────────────
   useEffect(() => {
+    // 1. Get initial network state immediately on mount
+    NetInfo.fetch().then(state => {
+      const offline = state.isConnected === false || state.isInternetReachable === false;
+      isNetworkOfflineRef.current = offline;
+      setIsOffline(offline || isRateLimitedRef.current);
+      isOfflineSV.value = offline || isRateLimitedRef.current;
+    });
+
+    // 2. Subscribe to network state transitions
     const unsubscribe = NetInfo.addEventListener(state => {
-      const offline = state.isConnected === false;
-      if (offline && !isOffline) {
+      const offline = state.isConnected === false || state.isInternetReachable === false;
+      const prev = isOfflineRef.current;
+      if (offline && !prev) {
         ttsService.speak('Connection lost. Switching to offline mode.', 'normal');
-      } else if (!offline && isOffline) {
+      } else if (!offline && prev && !isRateLimitedRef.current) {
         ttsService.speak('Connection restored. Online mode activated.', 'normal');
       }
-      setIsOffline(offline);
+      isNetworkOfflineRef.current = offline;
+      setIsOffline(offline || isRateLimitedRef.current);
+      isOfflineSV.value = offline || isRateLimitedRef.current;
     });
     return () => unsubscribe();
-  }, [isOffline]);
+  }, []);
+
+  // ── API Rate Limit Tracker & Automatic Offline Fallback ─────────────────────
+  useEffect(() => {
+    const checkLimits = () => {
+      const now = Date.now();
+      let limited = false;
+      
+      if (aiProvider === 'groq') {
+        limited = now < groqService.getRateLimitUntil();
+      } else if (aiProvider === 'featherless') {
+        limited = now < featherlessService.getRateLimitUntil();
+      }
+      
+      if (limited !== isRateLimitedRef.current) {
+        isRateLimitedRef.current = limited;
+        if (limited) {
+          console.log('[API Rate Limit] Detected active rate limit backoff! Switching to TFLite.');
+          ttsService.speak('API rate limit reached. Switching to local offline scanner.', 'normal');
+        } else {
+          console.log('[API Rate Limit] Cooldown expired! Switching back to online scanning.');
+          ttsService.speak('API rate limit expired. Resuming online scanner.', 'normal');
+        }
+        setIsOffline(isNetworkOfflineRef.current || limited);
+        isOfflineSV.value = isNetworkOfflineRef.current || limited;
+      }
+    };
+    
+    checkLimits();
+    const interval = setInterval(checkLimits, 1500);
+    return () => clearInterval(interval);
+  }, [aiProvider]);
 
   // ── Offline Object Detection (TFLite Frame Processor) ─────────────────────
   const objectDetectionPlugin = useTensorflowModel(TFLITE_MODEL, []);
@@ -201,13 +290,36 @@ export function NavigatorScreen() {
     () => (model != null ? NitroModules.box(model) : undefined),
     [model]
   );
+
+  // Diagnostic log for TFLite Model
+  useEffect(() => {
+    console.log('[TFLite] Object detection model state:', objectDetectionPlugin.state);
+    if (objectDetectionPlugin.state === 'loaded' && objectDetectionPlugin.model) {
+      const m = objectDetectionPlugin.model;
+      console.log('[TFLite] Model Loaded successfully!');
+      console.log('[TFLite] Inputs info:');
+      m.inputs.forEach((input: any, index) => {
+        console.log(`  Input #${index}: name="${input.name}" type="${input.dataType || input.type}" shape=[${input.shape?.join(', ')}]`);
+      });
+      console.log('[TFLite] Outputs info:');
+      m.outputs.forEach((output: any, index) => {
+        console.log(`  Output #${index}: name="${output.name}" type="${output.dataType || output.type}" shape=[${output.shape?.join(', ')}]`);
+      });
+    } else if (objectDetectionPlugin.state === 'error') {
+      console.error('[TFLite] Error loading model:', (objectDetectionPlugin as any).error);
+    }
+  }, [objectDetectionPlugin.state, objectDetectionPlugin.model]);
   const { resize } = useResizePlugin();
 
   const lastAnnouncedTime = useSharedValue(0);
+  const lastProcessedTime = useSharedValue(0);
+  const lastLoggedTime = useSharedValue(0);
+  const lastFrameLoggedTime = useSharedValue(0);
 
   const handleDetectedObjects = useCallback((detectedIndices: number[]) => {
     const unique = Array.from(new Set(detectedIndices));
-    const labels = unique.map(i => COCO_LABELS[i]).filter(Boolean);
+    // Try COCO_91 first (for 2-output SSD model), fall back to COCO_LABELS (for 4-output model)
+    const labels = unique.map(i => COCO_91[i] || COCO_LABELS[i] || '').filter(l => l.length > 0);
     if (labels.length > 0) {
       console.log('[OfflineDetection] Speaking:', labels.join(', '));
       ttsService.stop();
@@ -215,54 +327,117 @@ export function NavigatorScreen() {
     }
   }, []);
 
+  const handleDetectedObjectsJS = React.useMemo(
+    () => Worklets.createRunOnJS(handleDetectedObjects),
+    [handleDetectedObjects]
+  );
+
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
-    if (!isOffline || !isScanning || boxedModel == null) return;
+    const now = Date.now();
+    const isOff = isOfflineSV.value;
+    const isScan = isScanningSV.value;
+    const modelReady = boxedModel != null;
 
-    const tflite = boxedModel.unbox();
+    if (now - lastLoggedTime.value > 3000) {
+      lastLoggedTime.value = now;
+      console.log(
+        '[FrameProcessor] isOffline:', isOff,
+        'isScanning:', isScan,
+        'modelLoaded:', modelReady
+      );
+    }
 
-    // 1. Resize Frame to 320x320x3 for EfficientDet_lite0
-    const resized = resize(frame, {
-      scale: { width: 320, height: 320 },
-      pixelFormat: 'rgb',
-      dataType: 'uint8',
-    });
+    if (!isOff || !isScan || !modelReady) return;
 
-    // Avoid copying the buffer if it is already aligned
-    const inputBuffer = (resized.byteOffset === 0 && resized.byteLength === resized.buffer.byteLength)
-      ? resized.buffer
-      : resized.buffer.slice(resized.byteOffset, resized.byteOffset + resized.byteLength);
+    // Throttle to ~2.5 FPS (every 400ms)
+    if (now - lastProcessedTime.value < 400) return;
+    lastProcessedTime.value = now;
 
-    // EfficientDet outputs: [boxes, classes, scores, num_detections]
-    const outputs = tflite.runSync([inputBuffer as ArrayBuffer]);
-    if (outputs && outputs.length >= 4) {
-      const scores = new Float32Array(outputs[2]!);
-      const classes = new Float32Array(outputs[1]!);
-      const numDetectionsArray = new Float32Array(outputs[3]!);
+    try {
+      const tflite = boxedModel.unbox();
+
+      // SSD MobileNet V1 expects 300x300x3 uint8 RGB input
+      const resized = resize(frame, {
+        scale: { width: 300, height: 300 },
+        pixelFormat: 'rgb',
+        dataType: 'uint8',
+      });
+
+      const inputBuffer = (resized.byteOffset === 0 && resized.byteLength === resized.buffer.byteLength)
+        ? resized.buffer
+        : resized.buffer.slice(resized.byteOffset, resized.byteOffset + resized.byteLength);
+
+      const outputs = tflite.runSync([inputBuffer as ArrayBuffer]);
+
+      // Post-processed model outputs 4 tensors:
+      // Sort by byte length: num_detections(4) < classes(40) = scores(40) < boxes(160)
+      // For 10 detections: boxes=160B, classes=40B, scores=40B, num_detections=4B
+      const sorted = [...outputs].sort((a, b) => a.byteLength - b.byteLength);
+
+      const numDetectionsArr = new Float32Array(sorted[0]!);
+      const numDetections = Math.min(Math.round(numDetectionsArr[0] || 0), 10);
+
+      // Distinguish classes vs scores: classes are whole numbers, scores have fractions
+      let classesArr = new Float32Array(sorted[1]!);
+      let scoresArr = new Float32Array(sorted[2]!);
       
-      if (numDetectionsArray && numDetectionsArray.length > 0) {
-        const numDetections = numDetectionsArray[0];
-        const detected = [];
+      // Check which array has more fractional parts (= scores)
+      let fracSum1 = 0, fracSum2 = 0;
+      for (let i = 0; i < Math.min(classesArr.length, 10); i++) {
+        fracSum1 += Math.abs(classesArr[i]! - Math.round(classesArr[i]!));
+        fracSum2 += Math.abs(scoresArr[i]! - Math.round(scoresArr[i]!));
+      }
+      if (fracSum1 > fracSum2) {
+        const tmp = classesArr;
+        classesArr = scoresArr;
+        scoresArr = tmp;
+      }
+
+      if (now - lastFrameLoggedTime.value > 3000) {
+        lastFrameLoggedTime.value = now;
+        const topLabels: string[] = [];
+        for (let i = 0; i < Math.min(numDetections, 5); i++) {
+          const classId = Math.round(classesArr[i]!);
+          const score = scoresArr[i]!;
+          const label = COCO_91[classId] || COCO_LABELS[classId] || `class${classId}`;
+          topLabels.push(`${label}(${(score * 100).toFixed(0)}%)`);
+        }
+        console.log(
+          '[TFLite] Detections:', numDetections,
+          '| Output sizes:', outputs.map(o => o.byteLength).join(','),
+          '| Top:', topLabels.join(', ') || 'none'
+        );
+      }
+
+      if (numDetections > 0) {
+        const detected: number[] = [];
+        const seenLabels = new Set<string>();
         for (let i = 0; i < numDetections; i++) {
-          if (scores[i] > 0.40) {
-            let classIdx = Math.round(classes[i]);
-            // If out of bounds or 1-indexed, shift down
-            if (!COCO_LABELS[classIdx] && COCO_LABELS[classIdx - 1]) {
-              classIdx = classIdx - 1;
-            }
-            detected.push(classIdx);
+          const score = scoresArr[i]!;
+          if (score < 0.40) continue; // Skip low-confidence detections
+          
+          const classId = Math.round(classesArr[i]!);
+          const label = COCO_91[classId] || COCO_LABELS[classId] || '';
+          if (label.length > 0 && !seenLabels.has(label)) {
+            seenLabels.add(label);
+            detected.push(classId);
+            if (detected.length >= 3) break; // Max 3 unique objects
           }
         }
 
-        const now = Date.now();
-        // Throttle to every 3 seconds to avoid spamming the user
-        if (detected.length > 0 && now - lastAnnouncedTime.value > 2000) {
-          lastAnnouncedTime.value = now;
-          runOnJS(handleDetectedObjects)(detected);
+        if (detected.length > 0) {
+          const announceNow = Date.now();
+          if (announceNow - lastAnnouncedTime.value > 2500) {
+            lastAnnouncedTime.value = announceNow;
+            handleDetectedObjectsJS(detected);
+          }
         }
       }
+    } catch (err: any) {
+      console.error('[FrameProcessor] TFLite error:', err?.message || err);
     }
-  }, [boxedModel, isOffline, isScanning, handleDetectedObjects, resize, lastAnnouncedTime]);
+  }, [boxedModel, resize, lastAnnouncedTime, lastProcessedTime, handleDetectedObjectsJS]);
 
   // ── Initialization ──────────────────────────────────────────────────────────
 
@@ -649,14 +824,21 @@ export function NavigatorScreen() {
   }, [processDescription, setResponseLatency]);
 
   const startCameraScan = useCallback((interval: number) => {
-    const state = motionStateRef.current;
-    if (state.provider === 'gemini') {
+    // ── Offline Mode Fast Path ──
+    // If offline, background object detection is powered locally by the useFrameProcessor 
+    // worklet (TFLite) using the realtime preview. We do NOT need to take base64 photos.
+    if (isOfflineRef.current) {
+      cameraService.stop();
+      return;
+    }
+
+    if (aiProviderRef.current === 'gemini') {
       cameraService.start(cameraRef, interval, (base64Jpeg) => {
         if (specialModeRef.current !== 'none') return;
         latestSnapshotRef.current = motionService.getSnapshot();
         geminiService.sendFrame(base64Jpeg);
       });
-    } else if (state.provider === 'groq') {
+    } else if (aiProviderRef.current === 'groq') {
       cameraService.start(cameraRef, interval, (base64Jpeg) => {
         if (specialModeRef.current !== 'none') return;
         const snapshot = motionService.getSnapshot();
@@ -672,13 +854,25 @@ export function NavigatorScreen() {
   }, [handleGroqFrame, handleFeatherlessFrame]);
 
   const resumeBackgroundScanning = useCallback(() => {
+    if (ocrTimeoutRef.current) {
+      clearTimeout(ocrTimeoutRef.current);
+      ocrTimeoutRef.current = null;
+    }
+    if (detailedTimeoutRef.current) {
+      clearTimeout(detailedTimeoutRef.current);
+      detailedTimeoutRef.current = null;
+    }
+    if (resumeTimeoutRef.current) {
+      clearTimeout(resumeTimeoutRef.current);
+      resumeTimeoutRef.current = null;
+    }
     setSpecialMode('none');
     specialModeRef.current = 'none';
-    if (isScanning && connectionStatus === 'connected') {
+    if (isScanningRef.current && connectionStatusRef.current === 'connected') {
       console.log('[Camera] Resuming background scanning...');
-      startCameraScan(scanInterval);
+      startCameraScan(scanIntervalRef.current);
     }
-  }, [isScanning, connectionStatus, scanInterval, startCameraScan]);
+  }, [startCameraScan]);
 
   // ── Start scanning ────────────────────────────────────────────────────────
   const startScanning = useCallback(async () => {
@@ -690,11 +884,13 @@ export function NavigatorScreen() {
     setCurrencyTotals({});
     setScannedNotesHistory([]);
 
-    const activeKey = aiProvider === 'gemini' ? apiKey : (aiProvider === 'groq' ? groqApiKey : featherlessApiKey);
+    const activeKey = aiProviderRef.current === 'gemini' 
+      ? apiKeyRef.current 
+      : (aiProviderRef.current === 'groq' ? groqApiKeyRef.current : featherlessApiKeyRef.current);
     
-    if (!activeKey) {
+    if (!activeKey && !isOfflineRef.current) {
       announce(
-        `No API key set for ${aiProvider === 'gemini' ? 'Gemini' : (aiProvider === 'groq' ? 'Groq' : 'Featherless')}. Opening settings.`,
+        `No API key set for ${aiProviderRef.current === 'gemini' ? 'Gemini' : (aiProviderRef.current === 'groq' ? 'Groq' : 'Featherless')}. Opening settings.`,
       );
       router.push('/settings');
       return;
@@ -706,33 +902,42 @@ export function NavigatorScreen() {
 
     setIsScanning(true);
     setIsSilenced(false);
+
+    if (isOfflineRef.current) {
+      announce('Started scanning in offline mode.');
+      setConnectionStatus('connected');
+      Vibration.vibrate(80);
+      startCameraScan(scanIntervalRef.current);
+      return;
+    }
+
     announce(
-      `EchoSight started with ${aiProvider === 'gemini' ? 'Gemini' : (aiProvider === 'groq' ? 'Groq' : 'Featherless AI')}. ${aiProvider === 'gemini' ? 'Connecting…' : 'Ready.'}`,
+      `EchoSight started with ${aiProviderRef.current === 'gemini' ? 'Gemini' : (aiProviderRef.current === 'groq' ? 'Groq' : 'Featherless AI')}. ${aiProviderRef.current === 'gemini' ? 'Connecting…' : 'Ready.'}`,
     );
     Vibration.vibrate(80);
 
     try {
-      if (aiProvider === 'gemini') {
+      if (aiProviderRef.current === 'gemini') {
         // ── Gemini path ──
-        geminiService.textOnlyMode = useFastMode;
-        console.log(`[EchoSight] Connecting to Gemini (${useFastMode ? 'text-only/fast' : 'native audio'})...`);
-        await geminiService.connect(apiKey);
+        geminiService.textOnlyMode = useFastModeRef.current;
+        console.log(`[EchoSight] Connecting to Gemini (${useFastModeRef.current ? 'text-only/fast' : 'native audio'})...`);
+        await geminiService.connect(apiKeyRef.current);
         console.log('[EchoSight] Connected! Starting camera capture...');
-        startCameraScan(scanInterval);
-      } else if (aiProvider === 'groq') {
+        startCameraScan(scanIntervalRef.current);
+      } else if (aiProviderRef.current === 'groq') {
         // ── Groq path ──
-        groqService.setApiKey(groqApiKey);
-        groqService.setModel(groqModel);
+        groqService.setApiKey(groqApiKeyRef.current);
+        groqService.setModel(groqModelRef.current);
         setConnectionStatus('connected');
-        console.log(`[EchoSight] Groq ready (${groqModel}). Starting camera...`);
-        startCameraScan(scanInterval);
+        console.log(`[EchoSight] Groq ready (${groqModelRef.current}). Starting camera...`);
+        startCameraScan(scanIntervalRef.current);
       } else {
         // ── Featherless path ──
-        featherlessService.setApiKey(featherlessApiKey);
-        featherlessService.setModel(featherlessModel);
+        featherlessService.setApiKey(featherlessApiKeyRef.current);
+        featherlessService.setModel(featherlessModelRef.current);
         setConnectionStatus('connected');
-        console.log(`[EchoSight] Featherless ready (${featherlessModel}). Starting camera...`);
-        startCameraScan(scanInterval);
+        console.log(`[EchoSight] Featherless ready (${featherlessModelRef.current}). Starting camera...`);
+        startCameraScan(scanIntervalRef.current);
       }
 
       console.log('[EchoSight] Camera capture started');
@@ -749,7 +954,7 @@ export function NavigatorScreen() {
         'Failed to connect. Check your API key and network. Tap to retry.',
       );
     }
-  }, [apiKey, featherlessApiKey, groqApiKey, aiProvider, featherlessModel, groqModel, device, hasPermission, scanInterval, useFastMode, handleFeatherlessFrame, handleGroqFrame, isWeb, router, setConnectionStatus, setIsScanning]);
+  }, [device, hasPermission, isWeb, router, setConnectionStatus, setIsScanning, startCameraScan]);
 
   // ── Stop scanning ─────────────────────────────────────────────────────────
   const stopScanning = useCallback((silent: boolean = false) => {
@@ -815,7 +1020,41 @@ export function NavigatorScreen() {
   }, [isScanning]);
 
   useEffect(() => {
+    const intv = setInterval(() => {
+      console.log('[Camera Diagnostic]', {
+        isScanning,
+        appState,
+        isActive: isScanning && appState === 'active',
+        isOffline,
+        hasDevice: !!device,
+        hasModel: objectDetectionPlugin.state
+      });
+    }, 3000);
+    return () => clearInterval(intv);
+  }, [isScanning, appState, isOffline, device, objectDetectionPlugin.state]);
+
+  // ── Sync cameraService with network connection and scanning state ────────
+  useEffect(() => {
+    if (!isScanning) {
+      cameraService.stop();
+      return;
+    }
+
+    if (isOffline) {
+      console.log('[EchoSight] Sync Effect - Offline active: Stop JS interval captures');
+      cameraService.stop();
+    } else {
+      console.log('[EchoSight] Sync Effect - Online active: Start/Resume JS interval captures');
+      const state = motionStateRef.current;
+      if (state.status === 'connected' && specialModeRef.current === 'none') {
+        startCameraScan(scanInterval);
+      }
+    }
+  }, [isScanning, isOffline, scanInterval, startCameraScan]);
+
+  useEffect(() => {
     motionService.onMovementStart = () => {
+      if (isOfflineRef.current) return; // Skip online motion adjustments when offline
       console.log('[Motion] Movement started! Cancelling in-flight requests.');
       if (staticTimeoutRef.current) {
         clearTimeout(staticTimeoutRef.current);
@@ -838,6 +1077,7 @@ export function NavigatorScreen() {
     };
 
     motionService.onMovementStopped = () => {
+      if (isOfflineRef.current) return; // Skip online motion adjustments when offline
       console.log('[Motion] Movement settled! Forcing predictive capture.');
       const state = motionStateRef.current;
 
@@ -1155,7 +1395,7 @@ export function NavigatorScreen() {
     announce('Detailed scan. Describing your surroundings.');
 
     // Wait 3s to let the TTS finish speaking before the native shutter sound interrupts it
-    setTimeout(async () => {
+    detailedTimeoutRef.current = setTimeout(async () => {
       // Detailed scan: High compression (640px width, 0.5 quality) for faster upload/processing
       const frame = await captureCurrentFrame(640, 0.5);
       if (frame) {
@@ -1187,7 +1427,7 @@ export function NavigatorScreen() {
         
         // If successful, give the TTS 5 seconds to finish speaking before resuming background scans
         if (success) {
-          setTimeout(() => {
+          resumeTimeoutRef.current = setTimeout(() => {
             resumeBackgroundScanning();
           }, 5000);
         } else {
@@ -1198,7 +1438,7 @@ export function NavigatorScreen() {
         resumeBackgroundScanning();
       }
     }, 3000);
-  }, [isScanning, connectionStatus, captureCurrentFrame]);
+  }, [isScanning, connectionStatus, captureCurrentFrame, resumeBackgroundScanning]);
 
   // ── Swipe-down: OCR Text Recognition ────────────────────────────────
   const handleOcrScan = useCallback(async () => {
@@ -1213,7 +1453,7 @@ export function NavigatorScreen() {
     announce('Reading text. Please point camera at the text now.');
 
     // Wait 3s to let the user point the phone and the TTS to finish before capturing
-    setTimeout(async () => {
+    ocrTimeoutRef.current = setTimeout(async () => {
       latestSnapshotRef.current = motionService.getSnapshot();
 
       // OFFLINE OCR LOGIC
@@ -1238,7 +1478,7 @@ export function NavigatorScreen() {
         } catch(e) {
           announce('Offline reading failed.');
         }
-        setTimeout(() => {
+        resumeTimeoutRef.current = setTimeout(() => {
           resumeBackgroundScanning();
         }, 5000);
         return;
@@ -1280,7 +1520,7 @@ export function NavigatorScreen() {
 
         // If successful, give the TTS 5 seconds to finish speaking before resuming background scans
         if (success) {
-          setTimeout(() => {
+          resumeTimeoutRef.current = setTimeout(() => {
             resumeBackgroundScanning();
           }, 5000);
         } else {
@@ -1291,7 +1531,7 @@ export function NavigatorScreen() {
         resumeBackgroundScanning();
       }
     }, 3000);
-  }, [isScanning, connectionStatus, captureCurrentFrame, captureCroppedFrame, isOffline]);
+  }, [isScanning, connectionStatus, captureCurrentFrame, captureCroppedFrame, isOffline, resumeBackgroundScanning]);
 
   // ── PanResponder for reliable swipe gesture detection ──────────────────
   const panResponder = React.useMemo(
@@ -1375,8 +1615,9 @@ export function NavigatorScreen() {
           device={device}
           isActive={isScanning && appState === 'active'}
           photo={true}
+          video={true}
+          pixelFormat='rgb'
           frameProcessor={frameProcessor}
-          format={format}
         />
       )}
 
