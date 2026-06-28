@@ -12,17 +12,17 @@
  * Uses expo-sensors (Accelerometer) — no native module beyond what Expo provides.
  */
 
-import { Accelerometer, type AccelerometerMeasurement } from "expo-sensors";
+import { Accelerometer, type AccelerometerMeasurement } from 'expo-sensors';
 
 export type FallDetectedCallback = () => void;
 
 // ─── Detection thresholds ─────────────────────────────────────────────────────
-const FREEFALL_THRESHOLD = 0.3; // g-force below which we consider freefall
-const IMPACT_THRESHOLD = 2.5; // g-force above which we consider an impact
-const FREEFALL_MIN_DURATION = 80; // ms of freefall before we start looking for impact
-const IMPACT_WINDOW = 1000; // ms after freefall ends to detect impact
-const COOLDOWN_MS = 30_000; // Don't trigger again within 30 seconds
-const SAMPLE_INTERVAL = 50; // ms between accelerometer samples (20 Hz)
+const FREEFALL_THRESHOLD = 0.3;     // g-force below which we consider freefall
+const IMPACT_THRESHOLD = 2.5;       // g-force above which we consider an impact
+const FREEFALL_MIN_DURATION = 80;   // ms of freefall before we start looking for impact
+const IMPACT_WINDOW = 1000;         // ms after freefall ends to detect impact
+const COOLDOWN_MS = 30_000;         // Don't trigger again within 30 seconds
+const SAMPLE_INTERVAL = 50;         // ms between accelerometer samples (20 Hz)
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -35,8 +35,7 @@ function magnitude(data: AccelerometerMeasurement): number {
 
 export class FallDetectionService {
   private _enabled: boolean = false;
-  private _subscription: ReturnType<typeof Accelerometer.addListener> | null =
-    null;
+  private _subscription: ReturnType<typeof Accelerometer.addListener> | null = null;
 
   // State machine
   private freefallStart: number = 0;
@@ -54,16 +53,17 @@ export class FallDetectionService {
     try {
       const available = await Accelerometer.isAvailableAsync();
       if (!available) {
-        console.warn("[FallDetect] Accelerometer not available on this device");
+        console.warn('[FallDetect] Accelerometer not available on this device');
         return false;
       }
 
       Accelerometer.setUpdateInterval(SAMPLE_INTERVAL);
       this._subscription = Accelerometer.addListener(this._onData);
       this._enabled = true;
+      console.log('[FallDetect] Started monitoring');
       return true;
     } catch (err) {
-      console.warn("[FallDetect] Failed to start:", err);
+      console.warn('[FallDetect] Failed to start:', err);
       return false;
     }
   }
@@ -76,6 +76,7 @@ export class FallDetectionService {
     }
     this._enabled = false;
     this._resetState();
+    console.log('[FallDetect] Stopped monitoring');
   }
 
   get enabled(): boolean {
@@ -95,6 +96,7 @@ export class FallDetectionService {
     if (mag < FREEFALL_THRESHOLD) {
       if (this.freefallStart === 0) {
         this.freefallStart = now;
+        console.log(`[FallDetect] Freefall detected (mag: ${mag.toFixed(2)}g)`);
       }
     } else if (this.freefallStart > 0 && !this.lookingForImpact) {
       // Freefall ended — check if it lasted long enough
@@ -103,6 +105,7 @@ export class FallDetectionService {
         // Start looking for impact
         this.lookingForImpact = true;
         this.impactWindowStart = now;
+        console.log(`[FallDetect] Freefall ended after ${freefallDuration}ms, looking for impact...`);
       } else {
         this._resetState();
       }
@@ -112,12 +115,14 @@ export class FallDetectionService {
     if (this.lookingForImpact) {
       if (now - this.impactWindowStart > IMPACT_WINDOW) {
         // Too long since freefall — reset
+        console.log('[FallDetect] Impact window expired, resetting');
         this._resetState();
         return;
       }
 
       if (mag > IMPACT_THRESHOLD) {
         // FALL DETECTED!
+        console.log(`[FallDetect] 🚨 FALL DETECTED! Impact mag: ${mag.toFixed(2)}g`);
         this.lastTriggerTime = now;
         this._resetState();
         this.onFallDetected();
@@ -135,6 +140,7 @@ export class FallDetectionService {
   resetCooldown(): void {
     this.lastTriggerTime = 0;
     this._resetState();
+    console.log('[FallDetect] Cooldown manually reset');
   }
 }
 

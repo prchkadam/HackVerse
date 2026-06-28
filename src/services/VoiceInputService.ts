@@ -15,24 +15,18 @@
  * we send the raw audio directly. For Featherless (text-only), we use
  * the device's speech recognition as a fallback.
  */
-import {
-    AudioModule,
-    RecordingPresets,
-    requestRecordingPermissionsAsync,
-    setAudioModeAsync,
-} from "expo-audio";
-import * as FileSystem from "expo-file-system/legacy";
+import { AudioModule, requestRecordingPermissionsAsync, setAudioModeAsync, RecordingPresets } from 'expo-audio';
+import * as FileSystem from 'expo-file-system/legacy';
 
-export type ListeningState = "idle" | "listening" | "processing";
+export type ListeningState = 'idle' | 'listening' | 'processing';
 export type ListeningCallback = (state: ListeningState) => void;
 
 const MAX_RECORDING_DURATION_MS = 8000; // Auto-stop after 8 seconds
 
 export class VoiceInputService {
-  private recording: InstanceType<typeof AudioModule.AudioRecorder> | null =
-    null;
+  private recording: InstanceType<typeof AudioModule.AudioRecorder> | null = null;
   private autoStopTimer: ReturnType<typeof setTimeout> | null = null;
-  private _state: ListeningState = "idle";
+  private _state: ListeningState = 'idle';
   private _lastAutoStopAudio: string | null = null; // Cache audio from auto-stop
 
   // Callbacks
@@ -43,7 +37,7 @@ export class VoiceInputService {
   }
 
   get isListening(): boolean {
-    return this._state === "listening";
+    return this._state === 'listening';
   }
 
   /**
@@ -51,16 +45,16 @@ export class VoiceInputService {
    * Returns true if recording started successfully.
    */
   async startListening(): Promise<boolean> {
-    if (this._state !== "idle") {
-      console.warn("[Voice] Already listening or processing");
+    if (this._state !== 'idle') {
+      console.warn('[Voice] Already listening or processing');
       return false;
     }
 
     try {
       // Request microphone permission
       const { status } = await requestRecordingPermissionsAsync();
-      if (status !== "granted") {
-        console.warn("[Voice] Microphone permission denied");
+      if (status !== 'granted') {
+        console.warn('[Voice] Microphone permission denied');
         return false;
       }
 
@@ -71,34 +65,32 @@ export class VoiceInputService {
       });
 
       // Create recorder with high quality preset
-      const recording = new AudioModule.AudioRecorder(
-        RecordingPresets.HIGH_QUALITY,
-      );
+      const recording = new AudioModule.AudioRecorder(RecordingPresets.HIGH_QUALITY);
 
       // Prepare then start recording
       try {
         await recording.prepareToRecordAsync();
       } catch (prepErr) {
-        console.warn(
-          "[Voice] prepareToRecordAsync failed, trying record() directly:",
-          prepErr,
-        );
+        console.warn('[Voice] prepareToRecordAsync failed, trying record() directly:', prepErr);
       }
 
       recording.record();
 
       this.recording = recording;
-      this._setState("listening");
+      this._setState('listening');
+
+      console.log('[Voice] Recording started');
 
       // Auto-stop after MAX_RECORDING_DURATION_MS
       this.autoStopTimer = setTimeout(() => {
+        console.log('[Voice] Auto-stop after max duration');
         this._autoStop();
       }, MAX_RECORDING_DURATION_MS);
 
       return true;
     } catch (err) {
-      console.warn("[Voice] Failed to start recording:", err);
-      this._setState("idle");
+      console.warn('[Voice] Failed to start recording:', err);
+      this._setState('idle');
       return false;
     }
   }
@@ -112,8 +104,9 @@ export class VoiceInputService {
     const base64 = await this._stopAndGetBase64();
     if (base64) {
       this._lastAutoStopAudio = base64;
+      console.log(`[Voice] Auto-stop captured ${(base64.length / 1024).toFixed(1)}KB (cached for next triple-tap)`);
     }
-    this._setState("idle");
+    this._setState('idle');
   }
 
   /**
@@ -131,22 +124,20 @@ export class VoiceInputService {
     if (this._lastAutoStopAudio) {
       const cached = this._lastAutoStopAudio;
       this._lastAutoStopAudio = null;
-      this._setState("idle");
+      console.log(`[Voice] Returning cached auto-stop audio (${(cached.length / 1024).toFixed(1)}KB)`);
+      this._setState('idle');
       return cached;
     }
 
-    if (
-      !this.recording ||
-      (this._state !== "listening" && this._state !== "processing")
-    ) {
-      this._setState("idle");
+    if (!this.recording || (this._state !== 'listening' && this._state !== 'processing')) {
+      this._setState('idle');
       return null;
     }
 
-    this._setState("processing");
+    this._setState('processing');
 
     const base64Audio = await this._stopAndGetBase64();
-    this._setState("idle");
+    this._setState('idle');
     return base64Audio;
   }
 
@@ -168,7 +159,7 @@ export class VoiceInputService {
       this.recording = null;
 
       if (!uri) {
-        console.warn("[Voice] No recording URI after stop");
+        console.warn('[Voice] No recording URI after stop');
         return null;
       }
 
@@ -186,9 +177,10 @@ export class VoiceInputService {
       // Clean up the temp file
       await FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
 
+      console.log(`[Voice] Recording captured, size: ${(base64Audio.length / 1024).toFixed(1)}KB`);
       return base64Audio;
     } catch (err) {
-      console.warn("[Voice] Failed to stop recording:", err);
+      console.warn('[Voice] Failed to stop recording:', err);
       this.recording = null;
       return null;
     }
@@ -214,7 +206,8 @@ export class VoiceInputService {
       this.recording = null;
     }
 
-    this._setState("idle");
+    this._setState('idle');
+    console.log('[Voice] Recording cancelled');
   }
 
   private _setState(state: ListeningState): void {

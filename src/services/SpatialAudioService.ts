@@ -8,20 +8,19 @@
  * (usually 44100 or 48000 Hz) to ensure correct speed and pitch.
  * Chunks are scheduled sequentially for smooth continuous speech.
  */
-import { AudioContext } from "react-native-audio-api";
+import { AudioContext } from 'react-native-audio-api';
 
 const GEMINI_RATE = 24_000; // Gemini native-audio output rate
 
 // ─── Pure JS Base64 → Uint8Array (React Native compatible) ─────────────────────
-const CHARS =
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const LOOKUP = new Uint8Array(256);
 for (let i = 0; i < CHARS.length; i++) {
   LOOKUP[CHARS.charCodeAt(i)] = i;
 }
 
 function base64ToUint8Array(b64: string): Uint8Array {
-  const str = b64.replace(/=+$/, "").replace(/\s/g, "");
+  const str = b64.replace(/=+$/, '').replace(/\s/g, '');
   const len = str.length;
   const bufferLength = Math.floor((len * 3) / 4);
   const bytes = new Uint8Array(bufferLength);
@@ -45,10 +44,10 @@ function base64ToUint8Array(b64: string): Uint8Array {
 // ─── 16-bit little-endian PCM → Float32 normalised ────────────────────────────
 function pcmToFloat32(raw: Uint8Array): Float32Array {
   const samples = raw.length >> 1;
-  const f32 = new Float32Array(samples);
+  const f32     = new Float32Array(samples);
   for (let i = 0; i < samples; i++) {
-    const lo = raw[i * 2];
-    const hi = raw[i * 2 + 1];
+    const lo  = raw[i * 2];
+    const hi  = raw[i * 2 + 1];
     let val = (hi << 8) | lo;
     if (val >= 0x8000) val -= 0x10000;
     f32[i] = val / 32_768;
@@ -59,14 +58,10 @@ function pcmToFloat32(raw: Uint8Array): Float32Array {
 // ─── Resample audio using linear interpolation ────────────────────────────────
 // Converts from srcRate (e.g. 24000) → dstRate (e.g. 48000) so audio plays
 // at the correct speed and pitch on the device.
-function resample(
-  samples: Float32Array,
-  srcRate: number,
-  dstRate: number,
-): Float32Array {
+function resample(samples: Float32Array, srcRate: number, dstRate: number): Float32Array {
   if (srcRate === dstRate) return samples;
 
-  const ratio = dstRate / srcRate; // e.g. 48000/24000 = 2.0
+  const ratio = dstRate / srcRate;   // e.g. 48000/24000 = 2.0
   const outLen = Math.round(samples.length * ratio);
   const out = new Float32Array(outLen);
 
@@ -83,11 +78,11 @@ function resample(
 
 // ─── Service class ────────────────────────────────────────────────────────────
 export class SpatialAudioService {
-  private ctx: AudioContext | null = null;
-  private pan: number = 0;
-  private nextPlayTime: number = 0;
-  private chunksPlayed: number = 0;
-  private deviceRate: number = 48000; // Will be updated from context
+  private ctx:          AudioContext | null = null;
+  private pan:          number              = 0;
+  private nextPlayTime: number              = 0;
+  private chunksPlayed: number              = 0;
+  private deviceRate:   number              = 48000; // Will be updated from context
 
   /** Lazily create the AudioContext on first use */
   private _getContext(): AudioContext {
@@ -95,6 +90,7 @@ export class SpatialAudioService {
       this.ctx = new AudioContext();
       this.deviceRate = this.ctx.sampleRate || 48000;
       this.nextPlayTime = 0;
+      console.log(`[Audio] AudioContext created, device sample rate: ${this.deviceRate}Hz`);
     }
     return this.ctx;
   }
@@ -109,8 +105,8 @@ export class SpatialAudioService {
 
     try {
       // 1. Decode base64 → PCM → Float32
-      const raw = base64ToUint8Array(pcmBase64);
-      const f32 = pcmToFloat32(raw);
+      const raw  = base64ToUint8Array(pcmBase64);
+      const f32  = pcmToFloat32(raw);
 
       if (f32.length === 0) return;
 
@@ -126,8 +122,8 @@ export class SpatialAudioService {
       const source = ctx.createBufferSource();
       source.buffer = buffer;
 
-      const panner = ctx.createStereoPanner();
-      panner.pan.value = Math.max(-1, Math.min(1, pan));
+      const panner      = ctx.createStereoPanner();
+      panner.pan.value  = Math.max(-1, Math.min(1, pan));
 
       source.connect(panner);
       panner.connect(ctx.destination);
@@ -142,8 +138,14 @@ export class SpatialAudioService {
       this.nextPlayTime += buffer.duration;
 
       this.chunksPlayed++;
+      if (this.chunksPlayed <= 3 || this.chunksPlayed % 30 === 0) {
+        console.log(
+          `[Audio] Chunk #${this.chunksPlayed}: ${f32.length} → ${resampled.length} samples ` +
+          `(${GEMINI_RATE}→${this.deviceRate}Hz), dur: ${buffer.duration.toFixed(3)}s`
+        );
+      }
     } catch (err) {
-      console.warn("[SpatialAudio] Error playing chunk:", err);
+      console.warn('[SpatialAudio] Error playing chunk:', err);
     }
   }
 

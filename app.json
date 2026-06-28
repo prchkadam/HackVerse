@@ -11,7 +11,7 @@
       "bundleIdentifier": "com.echosight.app",
       "icon": "./assets/images/icon.png",
       "infoPlist": {
-        "NSCameraUsageDescription": "EchoSight uses your camera to detect obstacles and help you navigate safely.",
+        "NSCameraUsageDescription": "EchoSight needs camera access to detect obstacles.",
         "NSMicrophoneUsageDescription": "EchoSight may use the microphone for future voice command support."
       }
     },
@@ -23,10 +23,14 @@
         "backgroundImage": "./assets/images/android-icon-background.png"
       },
       "permissions": [
+        "android.permission.ACCESS_NETWORK_STATE",
         "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO",
         "android.permission.SEND_SMS",
-        "android.permission.CALL_PHONE"
+        "android.permission.CALL_PHONE",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
       ],
       "predictiveBackGestureEnabled": false
     },
@@ -41,7 +45,7 @@
         "react-native-vision-camera",
         {
           "cameraPermissionText": "EchoSight needs camera access to detect obstacles.",
-          "enableFrameProcessors": false,
+          "enableFrameProcessors": true,
           "enableCodeScanner": false
         }
       ],
@@ -75,7 +79,7 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "5d1932cf-8634-4b05-a82e-4ac04cad0f76"
+        "projectId": "e383f184-5000-47cc-b14d-5d74adf9f843"
       }
     }
   }

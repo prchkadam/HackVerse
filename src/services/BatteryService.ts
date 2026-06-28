@@ -7,16 +7,14 @@
  * (e.g., lower scan frequency, text-only mode).
  */
 
-import * as Battery from "expo-battery";
+import * as Battery from 'expo-battery';
 
 export type LowBatteryCallback = (level: number) => void;
 
 export class BatteryService {
   private _enabled: boolean = false;
   private _threshold: number = 0.2; // 20% default threshold
-  private _subscription: ReturnType<
-    typeof Battery.addBatteryLevelListener
-  > | null = null;
+  private _subscription: ReturnType<typeof Battery.addBatteryLevelListener> | null = null;
   private _lastNotifiedLevel: number | null = null;
 
   onLowBattery: LowBatteryCallback = () => {};
@@ -28,7 +26,7 @@ export class BatteryService {
     try {
       const isAvailable = await Battery.isAvailableAsync();
       if (!isAvailable) {
-        console.warn("[Battery] Battery API not available");
+        console.warn('[Battery] Battery API not available');
         return;
       }
 
@@ -37,15 +35,14 @@ export class BatteryService {
       this._checkLevel(level);
 
       // Listen for changes
-      this._subscription = Battery.addBatteryLevelListener(
-        ({ batteryLevel }) => {
-          this._checkLevel(batteryLevel);
-        },
-      );
+      this._subscription = Battery.addBatteryLevelListener(({ batteryLevel }) => {
+        this._checkLevel(batteryLevel);
+      });
 
       this._enabled = true;
+      console.log(`[Battery] Monitoring started (Threshold: ${this._threshold * 100}%)`);
     } catch (err) {
-      console.warn("[Battery] Failed to start:", err);
+      console.warn('[Battery] Failed to start:', err);
     }
   }
 
@@ -56,6 +53,7 @@ export class BatteryService {
     }
     this._enabled = false;
     this._lastNotifiedLevel = null;
+    console.log('[Battery] Monitoring stopped');
   }
 
   get enabled(): boolean {
@@ -72,6 +70,7 @@ export class BatteryService {
         this._lastNotifiedLevel === null ||
         this._lastNotifiedLevel - level >= 0.05
       ) {
+        console.log(`[Battery] Low battery detected: ${(level * 100).toFixed(0)}%`);
         this._lastNotifiedLevel = level;
         this.onLowBattery(level);
       }

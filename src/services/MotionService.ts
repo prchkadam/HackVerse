@@ -6,8 +6,8 @@
  * Option 2: Emitting an event on sudden, high-velocity movements.
  */
 
-import { Gyroscope } from "expo-sensors";
-import { Platform } from "react-native";
+import { Gyroscope } from 'expo-sensors';
+import { Platform } from 'react-native';
 
 export interface OrientationSnapshot {
   yaw: number;
@@ -18,6 +18,7 @@ export interface OrientationSnapshot {
 export class MotionService {
   private subscription: any = null;
   private isListening = false;
+  private isMoving = false;
 
   // Cumulative orientation (pseudo-angles in radians)
   private currentYaw = 0;
@@ -28,11 +29,12 @@ export class MotionService {
   private readonly HIGH_VELOCITY_THRESHOLD = 1.5; // rad/s
   private readonly SIGNIFICANT_DRIFT_THRESHOLD = 0.35; // ~20 degrees in radians
 
-  // Callback for instant cancellation
-  onFastMovement: () => void = () => {};
+  // Callbacks for predictive capturing
+  onMovementStart: () => void = () => {};
+  onMovementStopped: () => void = () => {};
 
   start() {
-    if (this.isListening || Platform.OS === "web") return;
+    if (this.isListening || Platform.OS === 'web') return;
 
     this.currentYaw = 0;
     this.currentPitch = 0;
@@ -53,15 +55,22 @@ export class MotionService {
       this.currentYaw += data.y * dt;
       this.currentPitch += data.x * dt;
 
-      // Option 2: High Velocity Check
-      // If the user whips their head around fast, instantly abort
-      const magnitude = Math.sqrt(
-        data.x * data.x + data.y * data.y + data.z * data.z,
-      );
-      if (magnitude > this.HIGH_VELOCITY_THRESHOLD) {
-        this.onFastMovement();
+      // Movement Tracking for Predictive Capture
+      const magnitude = Math.sqrt(data.x * data.x + data.y * data.y + data.z * data.z);
+      if (magnitude > 0.6) { // Moderate pan
+        if (!this.isMoving) {
+          this.isMoving = true;
+          this.onMovementStart();
+        }
+      } else if (magnitude < 0.2) { // Settled
+        if (this.isMoving) {
+          this.isMoving = false;
+          this.onMovementStopped();
+        }
       }
     });
+
+    console.log('[MotionService] Started tracking');
   }
 
   stop() {
@@ -70,6 +79,7 @@ export class MotionService {
       this.subscription = null;
     }
     this.isListening = false;
+    console.log('[MotionService] Stopped tracking');
   }
 
   /**
@@ -93,7 +103,7 @@ export class MotionService {
 
     const deltaYaw = this.currentYaw - snapshot.yaw;
     const deltaPitch = this.currentPitch - snapshot.pitch;
-
+    
     const drift = Math.sqrt(deltaYaw * deltaYaw + deltaPitch * deltaPitch);
     return drift > this.SIGNIFICANT_DRIFT_THRESHOLD;
   }
