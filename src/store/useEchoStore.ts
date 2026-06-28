@@ -121,7 +121,7 @@ export const useEchoStore = create<EchoState>((set, get) => ({
   // ── Defaults ──
   apiKey:             '',
   featherlessApiKey:  '',
-  groqApiKey:         'YOUR_GROQ_API_KEY',
+  groqApiKey:         process.env.EXPO_PUBLIC_GROQ_API_KEY || 'YOUR_GROQ_API_KEY',
   aiProvider:         'groq',
   featherlessModel:   'Qwen/Qwen3-VL-8B-Instruct',
   groqModel:          'meta-llama/llama-4-scout-17b-16e-instruct',
@@ -244,7 +244,7 @@ export const useEchoStore = create<EchoState>((set, get) => ({
       set({
         apiKey:            saved.apiKey            ?? '',
         featherlessApiKey: saved.featherlessApiKey ?? '',
-        groqApiKey:        saved.groqApiKey        || 'YOUR_GROQ_API_KEY',
+        groqApiKey:        saved.groqApiKey        || process.env.EXPO_PUBLIC_GROQ_API_KEY || 'YOUR_GROQ_API_KEY',
         aiProvider:        saved.aiProvider        ?? 'groq',
         featherlessModel:  saved.featherlessModel  ?? 'Qwen/Qwen3-VL-8B-Instruct',
         groqModel:         saved.groqModel         ?? 'meta-llama/llama-4-scout-17b-16e-instruct',
